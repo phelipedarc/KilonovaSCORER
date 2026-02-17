@@ -64,6 +64,7 @@ def parse_json_photometry(file_path: Path, merger_mjd: float):
 
     # Create DataFrame
     df = pd.DataFrame(results)
+    return df
 
 
 def load_observations(file_path, merger_mjd, dist_mpc, dist_err_mpc):
