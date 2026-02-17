@@ -9,7 +9,7 @@ from tqdm import tqdm
 from scipy.stats import gaussian_kde
 
 # Internal imports from your own package
-from .utils import timer_warp  # if you use the decorator here
+from .utils import *  # if you use the decorator here
 
 def parse_json_photometry(file_path: Path, merger_mjd: float):
     """
