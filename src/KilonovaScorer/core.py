@@ -74,6 +74,7 @@ def load_observations(file_path, merger_mjd, dist_mpc, dist_err_mpc):
     from pathlib import Path
 
     path = Path(file_path)
+    print('Loading Data: ',path)
     
     # 1. Load Raw Data
     if path.suffix.lower() == '.csv':
@@ -83,7 +84,7 @@ def load_observations(file_path, merger_mjd, dist_mpc, dist_err_mpc):
     
     elif path.suffix.lower() == '.json':
         # We pass merger_mjd to the json parser to filter pre-merger data
-        df = parse_json_photometry(path, merger_mjd)
+        df = parse_json_photometry(file_path, merger_mjd)
     
     else:
         raise ValueError(f"Unsupported file format: {path.suffix}")
