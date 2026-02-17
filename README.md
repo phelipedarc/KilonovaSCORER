@@ -16,3 +16,6 @@ You can install the package directly from GitHub using pip:
 ```bash
 pip install git+[https://github.com/phelipedarc/KilonovaSCORER.git](https://github.com/phelipedarc/KilonovaSCORER.git)
 
+
+
+#### Project developed At Northwestern University Dez 2025 - March 2025
