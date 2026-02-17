@@ -490,8 +490,6 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, List, Dict, Any, Optional
 
-# Assuming these are in your local package files
-from .utils import predictive_tail_kde_python, compute_consistent_ids_anyhit, overlap_chain
 
 def kilonovascorer_v1(
     data_obs: pd.DataFrame,
