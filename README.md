@@ -1,7 +1,7 @@
 
 
 <p align="left">
-  <img src="logo.png" width="400" title="KilonovaSCORER Logo">
+  <img src="logo2.png" width="600" title="KilonovaSCORER Logo">
 </p>
 
 # KilonovaScorer
@@ -20,5 +20,6 @@ pip install git+https://github.com/phelipedarc/KilonovaSCORER.git
 
 
 #### Project developed At Northwestern University Dez 2025 - March 2026
+
 
 
