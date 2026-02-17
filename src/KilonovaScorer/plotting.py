@@ -111,8 +111,7 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2):
     ax.legend(title="Band", ncols=2, fontsize=9)
     plt.tight_layout()
     plt.show()
-
-@timer_warp
+    
 def plot_observational_data_Apparent(data_obs):
     # 1. Define your marker and color mapping
     # Matches the 'g-band', 'r-band' format from your pipeline
