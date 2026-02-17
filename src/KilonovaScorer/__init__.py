@@ -1,4 +1,4 @@
-from .core import load_observations, kilonovascorer_v1,overlap_chain,preprocess_lsst_like
+from .core import load_observations, kilonovascorer_v1,overlap_chain,preprocess_lsst_like,binned_stats_cumulative_ptail
 from .plotting import plot_final_all_metrics, plot_simulations_LCS
 
 import pandas as pd
