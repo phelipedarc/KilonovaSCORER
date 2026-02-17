@@ -598,3 +598,248 @@ def plot_lc_probnear_global_survivors_and_survivor_models(
     fig.colorbar(sm_p, cax=cbar_ax).set_label(r"$P_{\mathrm{near,KNe}}$")
 
     plt.show()
+
+from matplotlib.colors import Normalize, LogNorm
+from matplotlib.cm import ScalarMappable
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from functools import wraps
+
+def plot_final_all_metrics(
+    metric_df,
+    data_sim,
+    binned_stats,
+    candidate_name,
+    cmap=plt.cm.magma,
+    max_models=100,
+    alpha_models=0.10,
+    lw_models=1.0,
+    seed=12345,
+    band_col_obs="band",
+    band_col_sim="filter_mapped",
+    time_col_obs="obs_time",
+    time_col_sim="time",
+    mag_col_obs="observed_mag",
+    err_col_obs="observed_mag_err",
+    mag_col_sim="absolute_magnitude",
+    id_col_sim="sample_id",
+    save_png=False
+):
+    # --------- Filter Candidate + Sort ----------
+    df = metric_df.copy()
+
+    if "candidate_name" in df.columns:
+        df = df[df["candidate_name"] == str(candidate_name)]
+        #df = df_full[mask].copy()
+    else:
+        df = df
+
+    if df.empty:
+        raise ValueError(f"No rows for candidate '{candidate_name}' in metric_df.")
+
+
+    df = df.sort_values([time_col_obs, band_col_obs]).reset_index(drop=True)
+
+    # --------- Compute Running Survivors ----------
+    sets = [set(x) if isinstance(x, (list, tuple, np.ndarray)) else set()
+            for x in df["consistent_ids"].values]
+    
+    running = sets[0].copy()
+    run_n = [len(running)]
+    run_ids = [sorted(running)]
+    for i in range(1, len(sets)):
+        running &= sets[i]
+        run_n.append(len(running))
+        run_ids.append(sorted(running))
+
+    run_df = df[[time_col_obs, band_col_obs, "n_consistent_lcs"]].copy()
+    run_df["n_running_survivors"] = np.array(run_n, dtype=int)
+    run_df["running_survivors_ids"] = run_ids
+
+    # --------- Identify Survivors Right Before Zero ----------
+    hit0 = np.where(run_df["n_running_survivors"].to_numpy() == 0)[0]
+    
+    if len(hit0) > 0:
+        i0 = int(hit0[0])
+        t_collapse = float(run_df.loc[i0, time_col_obs])
+        # Epoch immediately before going to zero
+        i_use = max(i0 - 1, 0)
+    else:
+        t_collapse = None
+        # Use last available epoch if it never hits zero
+        i_use = len(run_df) - 1
+
+    survivor_ids = run_df.loc[i_use, "running_survivors_ids"]
+    survivor_ids_plot = []
+    if survivor_ids:
+        if len(survivor_ids) > max_models:
+            rng = np.random.default_rng(seed)
+            survivor_ids_plot = rng.choice(survivor_ids, size=max_models, replace=False).tolist()
+        else:
+            survivor_ids_plot = list(survivor_ids)
+
+    # --------- Prep Plotting ----------
+    t = df[time_col_obs].to_numpy(float)
+    mag = df[mag_col_obs].to_numpy(float)
+    mag_err = df[err_col_obs].to_numpy(float)
+    pnear = df["prob_near"].to_numpy(float)
+    band = df[band_col_obs].astype(str).to_numpy()
+
+    marker_map = {"u-band": "o", "g-band": "s", "r-band": "^", "i-band": "D", "z-band": "v", "y-band": "P"}
+    band_colors = {"u-band": "#9467bd", "g-band": "#2ca02c", "r-band": "#d62728",
+                   "i-band": "#ff7f0e", "z-band": "#1f77b4", "y-band": "#8c564b"}
+
+    norm_p = Normalize(vmin=0.0, vmax=1.0)
+    sm_p = ScalarMappable(norm=norm_p, cmap=cmap)
+
+    
+    fig, (ax_lc, ax_p, ax_run, ax_cum) = plt.subplots(
+        4, 1, figsize=(11, 16), sharex=True,
+        gridspec_kw={"height_ratios": [2.2, 1.2, 1.2, 1.2]}, dpi=150
+    )
+
+
+
+    # (1) Panel 1: Light curve + Models right before collapse
+    sim_legend_handles = []
+    if len(survivor_ids_plot) > 0:
+        sim_sub = data_sim[data_sim[id_col_sim].isin(survivor_ids_plot)]
+        for b_str in np.unique(band):
+            sim_b = sim_sub[sim_sub[band_col_sim].astype(str) == str(b_str)]
+            color = band_colors.get(str(b_str), "grey")
+            for _, g in sim_b.groupby(id_col_sim):
+                g = g.sort_values(time_col_sim)
+                ax_lc.plot(g[time_col_sim], g[mag_col_sim], lw=lw_models, 
+                           alpha=alpha_models, color=color, zorder=1)
+            
+            line_handle, = ax_lc.plot([], [], color=color, lw=2, label=f"Sim {b_str}")
+            sim_legend_handles.append(line_handle)
+
+    obs_legend_handles = []
+    for b_str in np.unique(band):
+        m = band == b_str
+        mk = marker_map.get(b_str, "o")
+        for ti, mi, ei, pi in zip(t[m], mag[m], mag_err[m], pnear[m]):
+            ax_lc.errorbar(ti, mi, yerr=ei, fmt=mk, markersize=8, markeredgecolor="black",
+                           color=cmap(norm_p(pi)), alpha=0.9, zorder=3)
+        obs_handle, = ax_lc.plot([], [], marker=mk, linestyle="none", color="gray", 
+                                 markeredgecolor="black", label=f"Obs {b_str}")
+        obs_legend_handles.append(obs_handle)
+
+    ax_lc.invert_yaxis()
+    ax_lc.set_ylim(-9, -17)
+    ax_lc.set_ylabel("Absolute Mag (AB)",fontsize=14)
+    leg1 = ax_lc.legend(handles=obs_legend_handles, loc='lower right', fontsize=10, frameon=True, title="Obs Bands", ncol=2)
+    ax_lc.add_artist(leg1)
+    ax_lc.legend(handles=sim_legend_handles, loc='upper right', fontsize=10, frameon=True, title="Simulation Models", ncol=2)
+    ax_lc.grid(True, alpha=0.3)
+
+    # (2) Panel 2: prob_near vs time
+    for b_str in np.unique(band):
+        m = band == b_str
+        ax_p.scatter(t[m], pnear[m], marker=marker_map.get(b_str, "o"), s=60, 
+                     edgecolor="black", c=pnear[m], cmap=cmap, norm=norm_p, alpha=0.8)
+    ax_p.set_ylabel(r"$P_{\mathrm{near,KNe}}$",fontsize=14)
+    ax_p.axhline(y=0.2, color="darkred", lw=1.2, alpha=0.5, linestyle="--")
+    ax_p.set_ylim(-0.05, 1.05)
+    ax_p.grid(True, alpha=0.3)
+
+    # (3) Panel 3: Global running survivors (RELATIVE)
+    y_rel = run_df["n_running_survivors"].to_numpy() / run_df["n_consistent_lcs"].to_numpy()
+    ax_run.plot(run_df[time_col_obs], y_rel, lw=2.5, color="indigo", zorder=2)
+    
+    n_for_color = np.clip(run_df["n_running_survivors"], 1, None)
+    norm_log = LogNorm(vmin=1, vmax=max(n_for_color) if max(n_for_color) > 1 else 10)
+    sc = ax_run.scatter(run_df[time_col_obs], y_rel, c=n_for_color, norm=norm_log, cmap='Spectral', 
+                        s=75, edgecolors='black', zorder=3)
+
+    ax_run.set_yscale("symlog", linthresh=0.05)
+    ax_run.set_ylim(-0.01, 1.5)
+    ax_run.set_ylabel("Rel. Acceptance",fontsize=14)
+    #ax_run.set_xlabel("Time since merger [days]")
+    ax_run.grid(True, alpha=0.3)
+    ax_run.axhline(y=0.1, color="darkred", lw=1.2, alpha=0.4, linestyle="--")
+    ax_run.axhline(y=0, color="darkred", lw=1.2, alpha=0.9, linestyle="-")
+
+    cax_in = inset_axes(ax_run, width="30%", height="5%", loc="upper right", borderpad=1.5)
+    fig.colorbar(sc, cax=cax_in, orientation="horizontal").set_label("Accepted Sims", fontsize=12)
+
+    # --------- 6. Panel 4: Cumulative Split Score ----------
+    b_df = binned_stats.dropna(subset=['time_mid']).copy()
+    # Force float to avoid Categorical comparison error
+    t_mid = pd.to_numeric(b_df['time_mid'], errors='coerce').values
+    r_mean = b_df['running_mean'].values
+    r_std = b_df['running_std'].values
+    
+    # Define the split
+    m_pre = t_mid <= (t_collapse if t_collapse is not None else 1e9)
+    m_post = t_mid >= (t_collapse if t_collapse is not None else 1e9)
+
+    # A. Isolated Bin Score (The "faint" background)
+    ax_cum.errorbar(t_mid, b_df['mean'], yerr=b_df['std'], fmt='o', c='grey', alpha=0.3, label='Bin Score', markersize=4)
+
+    # B. Ghost Plot (What would have happened without collapse)
+    ax_cum.plot(t_mid, r_mean, color='purple', marker='s', lw=2, alpha=0.2, label='Base (Uncorrected)')
+    ax_cum.fill_between(t_mid, r_mean-r_std, r_mean+r_std, color='purple', alpha=0.05)
+
+    # C. Effective Score (Goes to zero after t0)
+    eff_mean = np.where(m_pre, r_mean, 0.0)
+    eff_std = np.where(m_pre, r_std, 0.1)
+    
+    # Plotting effective score as a continuous line that "breaks" at t0
+    ax_cum.plot(t_mid, eff_mean, color='purple', marker='s', lw=2, label='Cumulative Score')
+    ax_cum.fill_between(t_mid, eff_mean-eff_std, eff_mean+eff_std, color='purple', alpha=0.15, label=r'$\pm 1\sigma$')
+
+    # D. Annotation Labels
+    for i, val in enumerate(b_df['count'].astype(int)):
+        ax_cum.text(t_mid[i], r_mean[i]+0.05, str(val), ha='center', fontsize=9, fontweight='bold')
+
+    ax_cum.set_ylabel("Cumulative Score",fontsize=14)
+    ax_cum.set_xlabel("Time since merger [days]",fontsize=18)
+    ax_cum.set_ylim(-0.1, 1.05)
+    ax_cum.set_xlim(0,10.1)
+    ax_cum.legend(loc='upper left', fontsize=12, ncol=4)
+    from matplotlib.ticker import MultipleLocator
+
+    # Set major ticks every 0.5 days
+    ax_cum.xaxis.set_major_locator(MultipleLocator(0.5))
+    
+    # Optional: Set minor ticks every 0.1 days for even more precision
+    ax_cum.xaxis.set_minor_locator(MultipleLocator(0.1))
+    
+    # Increase x-tick label size for readability
+    ax_cum.tick_params(axis='x', labelsize=12, rotation=0)
+    #ax_cum.grid(True, which='major', axis='x', color='black', alpha=0.5, linestyle='-')
+    #ax_cum.grid(True, which='minor', axis='x', color='grey', alpha=0.1, linestyle=':')
+
+    # --------- 7. Global Polish ----------
+    if t_collapse is not None:
+        for ax in (ax_lc, ax_p, ax_run, ax_cum):
+            ax.axvline(t_collapse, color="darkred", linestyle=":", lw=2.5, alpha=0.8)
+
+    for ax in (ax_lc, ax_p, ax_run, ax_cum):
+        ax.grid(True, alpha=0.3, ls='--')
+    
+    # 1. Adjust subplots 
+    fig.subplots_adjust(right=0.85)
+    
+    # 2. Define the broad axis
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.04, 0.7])
+    
+    # 3. Create the colorbar object
+    cbar = fig.colorbar(sm_p, cax=cbar_ax)
+    
+    # 4. Set the main label (P_near)
+    cbar.set_label(r"$P_{\mathrm{near,KNe}}$", fontsize=18, fontweight='bold', labelpad=15)
+    
+    # 5. INCREASE THE NUMBER FONT (Tick labels)
+    cbar.ax.tick_params(labelsize=14) 
+    
+    if save_png==True:
+        plt.savefig(f'{candidate_name}_final_score.png',dpi=300)
+    plt.show()
+
+
+
+
+
+
