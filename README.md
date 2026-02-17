@@ -18,4 +18,5 @@ pip install git+[https://github.com/phelipedarc/KilonovaSCORER.git](https://gith
 
 
 
-#### Project developed At Northwestern University Dez 2025 - March 2025
+#### Project developed At Northwestern University Dez 2025 - March 2026
+
