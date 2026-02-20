@@ -8,6 +8,20 @@ from pathlib import Path
 from tqdm import tqdm
 from scipy.stats import gaussian_kde
 
+import sys
+import time
+def arcade_progress_bar(current, total, bar_length=30):
+    """
+    Prints an arcade-style progress bar to the console.
+    """
+    percent = current / total
+    filled_length = int(bar_length * percent)
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    sys.stdout.write(f'\r[ {bar} ] {percent*100:6.2f}% ⬛')
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write('\n')
+
 # Internal imports from your own package
 from .utils import *  # if you use the decorator here
 
@@ -493,6 +507,7 @@ import pandas as pd
 from typing import Tuple, List, Dict, Any, Optional
 
 
+
 def kilonovascorer_v1(
     data_obs: pd.DataFrame,
     data_sim: pd.DataFrame,
@@ -548,6 +563,10 @@ def kilonovascorer_v1(
         # 3. Process Observations sequentially
         # Sorting by time ensures the results list follows chronological order
         obs_band = obs_band.sort_values("time_after_gw")
+
+        #setup progress bar
+        count = 0
+        total_count = len(obs_band)
 
         for _, obs_row in obs_band.iterrows():
             t_obs = float(obs_row["time_after_gw"])
@@ -607,6 +626,9 @@ def kilonovascorer_v1(
             band_times.append(t_obs)
             band_ids_lists.append(consistent_ids)
             band_row_indices.append(len(results) - 1)
+            arcade_progress_bar(count, total_count, bar_length=50)
+            count = count+1
+            
 
         # 4. Post-processing: Compute the Overlap Chain (ABC-Diagnostic)
         if band_ids_lists:
