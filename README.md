@@ -44,6 +44,15 @@ git clone https://github.com/phelipedarc/KilonovaSCORER
 cd KilonovaSCORER
 pip install -e .
 ```
+Creating your set of simulations:
+```bash
+data_sim_all = ks.simulation.simulate_kilonova(N_SIM=1000, MODEL_NAME='two_component_kilonova_model', SAVE_CSV=False)
+data_sim_all['filter_mapped'] = data_sim_all['band'].str.lower().map(FILTER_LOOKUP)
+```
+or running the script
+```bash
+simulating_kne_pop.py --nsim 100000 
+```
 
 ## Core Functionality
 
@@ -73,6 +82,7 @@ This project was developed at **Northwestern University** (December 2025 – Mar
 Corresponding email: phelipedarc@gmail.com
 
 About me: https://phelipedarc.github.io/
+
 
 
 
