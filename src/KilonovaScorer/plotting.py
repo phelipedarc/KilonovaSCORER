@@ -6,6 +6,8 @@ from matplotlib.colors import LogNorm, Normalize
 from matplotlib.cm import ScalarMappable
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from scipy.stats import gaussian_kde
+from matplotlib.ticker import MultipleLocator
+
 
 
 def set_plot_style():
@@ -57,21 +59,21 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2):
     key = band_codes * n_time + time_idx
     size = n_bands * n_time
     
-    # use float64 accumulators for numerical stability on huge N
+    # float64 accumulators for numerical stability on huge N
     m64 = m.astype(np.float64, copy=False)
     
     counts = np.bincount(key, minlength=size).astype(np.int64)
     sum_m = np.bincount(key, weights=m64, minlength=size)
     sum_m2 = np.bincount(key, weights=m64 * m64, minlength=size)
     
-    # mean and (population) std; if you want sample std, see note below
+    # mean and (population) std
     mean = np.full(size, np.nan, dtype=np.float64)
     std = np.full(size, np.nan, dtype=np.float64)
     
     nz = counts > 0
     mean[nz] = sum_m[nz] / counts[nz]
     var = (sum_m2[nz] / counts[nz]) - mean[nz] ** 2
-    var = np.maximum(var, 0.0)  # numerical guard
+    var = np.maximum(var, 0.0) 
     std[nz] = np.sqrt(var)
     
     mean = mean.reshape(n_bands, n_time)
@@ -102,15 +104,43 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2):
         ax.fill_between(x, ylo, yhi, alpha=0.25, linewidth=0, label=str(band))
         ax.plot(x, y, linewidth=1.4)
     
+    # ax.set_xlabel("Time [days]")
+    # ax.set_ylabel("Simulated Absolute magnitude [AB]")
+    # ax.invert_yaxis() 
+    # ax.set_ylim(0,-20)
+    # ax.set_xlim(0,10)
+    # ax.grid(alpha=0.3)
+    # ax.legend(title="Band", ncols=2, fontsize=9)
+    # plt.tight_layout()
+    # plt.show()    
+    # Axis labels
     ax.set_xlabel("Time [days]")
     ax.set_ylabel("Simulated Absolute magnitude [AB]")
-    ax.invert_yaxis()  # magnitudes: brighter = smaller
-    ax.set_ylim(0,-20)
-    ax.set_xlim(0,10)
-    ax.grid(alpha=0.3)
-    ax.legend(title="Band", ncols=2, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, -20)
+    # Major ticks 
+    ax.xaxis.set_major_locator(MultipleLocator(1.0))
+    # Minor ticks every 0.2 days
+    ax.xaxis.set_minor_locator(MultipleLocator(0.2))
+    # Draw grid BEHIND data
+    ax.set_axisbelow(True)
+    # Major grid (subtle)
+    ax.grid(which="major", alpha=0.25)
+    # Minor grid (light purple)
+    ax.grid(
+        which="minor",
+        color="#d8c6ff",   # light scientific purple
+        linestyle="-",
+        linewidth=0.6,
+        alpha=0.6
+    )
+    
+    # Legend
+    ax.legend(title="Band", ncols=2, fontsize=11)
     plt.tight_layout()
     plt.show()
+
     
 def plot_observational_data_Apparent(data_obs):
     # 1. Define your marker and color mapping
