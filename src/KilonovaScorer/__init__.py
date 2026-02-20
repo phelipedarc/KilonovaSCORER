@@ -7,5 +7,8 @@ import pandas as pd
 import numpy as np
 import json
 from pathlib import Path
+import matplotlib as mpl
+
+mpl.rcParams["text.usetex"] = False
 
 __version__ = "0.1.0"
