@@ -7,7 +7,9 @@ from matplotlib.cm import ScalarMappable
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from scipy.stats import gaussian_kde
 from matplotlib.ticker import MultipleLocator
+import matplotlib as mpl
 
+mpl.rcParams["text.usetex"] = False
 
 
 def set_plot_style():
