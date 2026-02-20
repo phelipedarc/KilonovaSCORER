@@ -35,7 +35,7 @@ def simulate_single_sample(sample_id, MODEL_NAME, TIME, FILTER_BANDS, z, mu, RAN
 
     prior = redback.priors.get_priors(model=MODEL_NAME)
     if MODEL_NAME == 'two_component_kilonova_model':
-        prior['mej_1'] = Uniform(minimum=1e-4, maximum=0.1,  name='mej_1', latex_label='$M_{\\mathrm{ej}~1}~(M_\\odot)$', unit=None,  oundary=None)
+        prior['mej_1'] = Uniform(minimum=1e-4, maximum=0.1,  name='mej_1', latex_label='$M_{\\mathrm{ej}~1}~(M_\\odot)$', unit=None,  boundary=None)
         prior['mej_2'] = Uniform(minimum=1e-4, maximum=0.1,  name='mej_2', latex_label='$M_{\\mathrm{ej}~2}~(M_\\odot)$', unit=None, boundary=None)
         #Ejecta velocity:
         prior['vej_1'] = Uniform(minimum=0.01, maximum=0.7, name='vej_1', latex_label='$v_{\\mathrm{ej}~1}~(c)$', unit=None, boundary=None)
