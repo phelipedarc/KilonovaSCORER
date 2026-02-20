@@ -14,7 +14,6 @@ from bilby.core.prior import Uniform
 
 import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
-import lal
 
 def arcade_progress_bar(current, total, bar_length=30):
     """
