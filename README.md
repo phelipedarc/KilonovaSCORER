@@ -4,7 +4,7 @@
   <img src="logo2.png" width="620" title="KilonovaSCORER Logo">
 </p>
 
-# KilonovaScorer
+# KilonovaSCORER
 
 **A Simulation-Based Scoring Framework for Early Identification of Kilonova Candidates**
 
@@ -73,6 +73,7 @@ This project was developed at **Northwestern University** (December 2025 – Mar
 Corresponding email: phelipedarc@gmail.com
 
 About me: https://phelipedarc.github.io/
+
 
 
 
