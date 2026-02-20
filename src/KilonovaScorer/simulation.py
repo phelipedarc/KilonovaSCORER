@@ -65,15 +65,34 @@ def simulate_kilonova(N_SIM=100000, MODEL_NAME='two_component_kilonova_model', S
         prior['kappa_1'] = Uniform(0.1, 0.5)
         prior['kappa_2'] = Uniform(1, 30)
 
-    # ------------------------
-    # Worker function
-    # ------------------------
-    def simulate_single_sample(sample_id):
+    # --- Worker function at top level ---
+    def simulate_single_sample(sample_id, MODEL_NAME, TIME, FILTER_BANDS, z, mu, RANDOM_SEED=42):
+        import numpy as np
+        import pandas as pd
+        import redback
+        from redback.model_library import all_models_dict
+    
+        # Build priors
+        prior = redback.priors.get_priors(model=MODEL_NAME)
+        if MODEL_NAME == 'metzger_kilonova_model':
+            from bilby.core.prior import Uniform
+            prior['mej'] = Uniform(1e-4, 0.1)
+            prior['vej'] = Uniform(0.01, 0.5)
+            prior['kappa'] = Uniform(0.1, 30)
+        elif MODEL_NAME == 'two_component_kilonova_model':
+            from bilby.core.prior import Uniform
+            prior['mej_1'] = Uniform(1e-4, 0.1)
+            prior['mej_2'] = Uniform(1e-4, 0.1)
+            prior['vej_1'] = Uniform(0.01, 0.7)
+            prior['vej_2'] = Uniform(0.01, 0.7)
+            prior['kappa_1'] = Uniform(0.1, 0.5)
+            prior['kappa_2'] = Uniform(1, 30)
+    
         np.random.seed(RANDOM_SEED + sample_id)
         params = prior.sample()
         params['redshift'] = z
         model_func = all_models_dict[MODEL_NAME]
-
+    
         rows = []
         for band in FILTER_BANDS:
             mag = model_func(TIME, **params, output_format='magnitude', bands=[band])
@@ -85,23 +104,22 @@ def simulate_kilonova(N_SIM=100000, MODEL_NAME='two_component_kilonova_model', S
                 'magnitude': mag,
                 'absolute_magnitude': abs_mag
             }
-            # Add all sampled parameters dynamically
             for k, v in params.items():
                 row_dict[k] = v
             rows.append(pd.DataFrame(row_dict))
         return pd.concat(rows, ignore_index=True)
-
-    # ------------------------
-    # Parallel execution
-    # ------------------------
-    ncores = max(1, min(cpu_count() - 1, 8))
-    print(f"Simulating {N_SIM} samples using {ncores} cores...")
-
+    
+        # ------------------------
+        # Parallel execution
+        # ------------------------
+        ncores = max(1, min(cpu_count() - 1, 8))
+        print(f"Simulating {N_SIM} samples using {ncores} cores...")
+    
     with Pool(ncores) as pool:
-        all_samples = list(tqdm(pool.imap(simulate_single_sample, range(N_SIM)),
+        args_list = [(i, MODEL_NAME, TIME, FILTER_BANDS, z, mu) for i in range(N_SIM)]
+        all_samples = list(tqdm(pool.starmap(simulate_single_sample, args_list),
                                 total=N_SIM, desc="Simulating"))
 
-    df = pd.concat(all_samples, ignore_index=True)
 
     # ------------------------
     # Save CSV if requested
