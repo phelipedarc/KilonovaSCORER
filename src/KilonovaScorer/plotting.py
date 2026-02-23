@@ -26,7 +26,7 @@ def set_plot_style():
 
 
 
-def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2):
+def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2, save_png=True):
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
@@ -141,6 +141,9 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2):
     # Legend
     ax.legend(title="Band", ncols=2, fontsize=11)
     plt.tight_layout()
+    
+    if save_png==True:
+        plt.savefig(f'simulated_LCs.png',dpi=300)
     plt.show()
 
     
