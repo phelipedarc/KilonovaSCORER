@@ -37,8 +37,10 @@ def compute_abs_mag_samples(app_mag, app_mag_err, dist_mpc, dist_err_mpc, n_samp
     Pass dist_mpc and dist_err_mpc explicitly.
     
     """
-    # 1. Validation
-    if any(np.isnan([dist_mpc, app_mag])) or dist_mpc <= 0:
+    if (not np.isfinite(dist_mpc)) or dist_mpc <= 0:
+        return np.nan, np.nan
+
+    if np.any(~np.isfinite(app_mag)):
         return np.nan, np.nan
     
     app_mag_err = max(0, app_mag_err) if np.isfinite(app_mag_err) else 0.0
