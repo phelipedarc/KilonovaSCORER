@@ -120,7 +120,7 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2, save_png=True):
     ax.set_ylabel("Simulated Absolute magnitude [AB]")
     ax.invert_yaxis()
     ax.set_xlim(0, 10)
-    ax.set_ylim(0, -20)
+    ax.set_ylim(-10, -20)
     # Major ticks 
     ax.xaxis.set_major_locator(MultipleLocator(1.0))
     # Minor ticks every 0.2 days
