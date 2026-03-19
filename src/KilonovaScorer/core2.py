@@ -1,379 +1,722 @@
 """
-kilonovascorer_fast.py
-======================
-Accelerated version of kilonovascorer_v1 using:
-  1. Pre-grouped time-bin cache     — eliminates repeated DataFrame scans
-  2. Per-bin KDE precomputation     — KDE built once per (band, bin), not per observation
-  3. Vectorised ROPE filtering      — replaces per-row Python logic with NumPy masks
-  4. iterrows() eliminated          — replaced with to_numpy() record iteration
-  5. Vectorised Charlie's method    — full broadcast, no Python loop
+core.py — KilonovaScorer core pipeline.
 
-Speedup profile (10^5 simulations, ~4 bands, ~20 obs/band):
-  - KDE precomputation:   ~10-20x fewer gaussian_kde builds
-  - Pre-grouped bins:     ~O(N) -> O(1) bin lookup
-  - Vectorised ROPE:      ~5-10x faster consistent_ids
-  - No iterrows():        ~3-5x faster observation loop
+Implements:
+  - JSON / CSV photometry loading with absolute magnitude computation
+  - LSST-like cadence downsampling
+  - P_tail_KNe and P_near_KNe scoring via noise-convolved KDE (predictive_tail_kde)
+  - ABC sequential survival diagnostic (overlap_chain)
+  - Logit-space inverse-variance weighted cumulative scoring
 """
 
+# ---------------------------------------------------------------------------
+# Standard library
+# ---------------------------------------------------------------------------
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Third-party
+# ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
-from typing import Dict, Tuple, List, Any, Optional
-import sys
-
 
 # ---------------------------------------------------------------------------
-# Progress bar (unchanged)
+# Internal
+# ---------------------------------------------------------------------------
+from .utils import *  # noqa: F401,F403  (decorators and helpers)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Progress bar
 # ---------------------------------------------------------------------------
 
 def arcade_progress_bar(current: int, total: int, bar_length: int = 30) -> None:
-    percent = current / max(total, 1)
+    """Print an arcade-style progress bar to stdout."""
+    percent = current / total
     filled = int(bar_length * percent)
-    bar = '█' * filled + '-' * (bar_length - filled)
-    sys.stdout.write(f'\r[ {bar} ] {percent*100:6.2f}% ⬛')
+    bar = "█" * filled + "-" * (bar_length - filled)
+    sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}% ⬛")
     sys.stdout.flush()
-    if current >= total:
-        sys.stdout.write('\n')
+    if current == total:
+        sys.stdout.write("\n")
 
 
 # ---------------------------------------------------------------------------
-# 1. KDE Cache — build once per (band, time_bin)
+# Photometry loading
 # ---------------------------------------------------------------------------
 
-class BinKDECache:
+def parse_json_photometry(file_path: Path, merger_mjd: float) -> pd.DataFrame:
     """
-    Precomputes and caches gaussian_kde objects and resampled draws
-    for every (band, time_bin) combination.
+    Extract photometry from a JSON file following the standard schema.
 
-    At 10^5 simulations this is the single largest speedup:
-    instead of rebuilding the KDE for every observation that falls
-    in the same bin, we build it once and reuse the draws.
+    Returns a DataFrame with raw band names ready for FILTER_LOOKUP mapping.
+    Pre-merger timestamps and upper limits are excluded.
 
     Parameters
     ----------
-    n_sim : int
-        Number of Monte Carlo draws per bin (default 50_000).
-    min_sim_points : int
-        Minimum number of simulation points required to build a KDE.
+    file_path : Path
+        Path to the JSON photometry file.
+    merger_mjd : float
+        MJD of the GW merger event; observations before this are discarded.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: time, time_after_gw, magnitude, e_magnitude, band,
+        instrument, telescope.  Empty DataFrame on parse failure.
     """
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        logger.error("Failed to decode JSON from %s", file_path)
+        return pd.DataFrame()
 
-    def __init__(self, n_sim: int = 50_000, min_sim_points: int = 20):
-        self.n_sim = n_sim
-        self.min_sim_points = min_sim_points
-        # cache[band][bin_idx] = {"kde": ..., "x_star": ..., "ids": ...}
-        self._cache: Dict[str, Dict[int, Dict]] = {}
+    if "photometry" not in data:
+        logger.warning("No 'photometry' key found in %s", file_path)
+        return pd.DataFrame()
 
-    def build(self, band: str, sim_band: pd.DataFrame) -> None:
-        """
-        Pre-build KDEs and draw samples for all bins in sim_band at once.
-        Call once per band before the observation loop.
+    records = []
+    for entry in data["photometry"]:
+        # 1. Validate timestamp
+        t = entry.get("timestamp")
+        if t is None or t < merger_mjd:
+            continue
 
-        Also caches a numpy array of (bin_idx, absolute_magnitude, sample_id)
-        for fast vectorised ROPE filtering.
-        """
-        self._cache[band] = {}
+        # 2. Extract nested magnitude / filter
+        val = entry.get("value", {})
+        app_mag = val.get("magnitude")
+        app_err = val.get("error", 0)
+        raw_filter = val.get("filter")
 
-        # Group by time_bin once — O(N) scan, result reused for all observations
-        grouped = sim_band.groupby("time_bin", sort=False)
+        # 3. Quality control — skip upper limits and missing data
+        if app_mag is None or raw_filter is None or val.get("upper_limit", False):
+            continue
 
-        for bin_idx, grp in grouped:
-            mags = grp["absolute_magnitude"].to_numpy(dtype=float)
-            ids  = grp["sample_id"].to_numpy()
+        # 4. Append standardised record
+        # "band" kept as raw string (e.g. 'ztfg') for downstream FILTER_LOOKUP.
+        records.append({
+            "time": t,
+            "time_after_gw": t - merger_mjd,
+            "magnitude": float(app_mag),
+            "e_magnitude": float(app_err),
+            "band": str(raw_filter).lower().strip(),
+            "instrument": entry.get("instrument", "unknown"),
+            "telescope": entry.get("telescope", "unknown"),
+        })
 
-            if len(mags) < self.min_sim_points:
-                continue  # skip sparse bins
+    return pd.DataFrame(records)
 
-            kde    = gaussian_kde(mags)
-            x_star = kde.resample(self.n_sim)[0]          # (n_sim,)
 
-            self._cache[band][int(bin_idx)] = {
-                "kde":    kde,
-                "x_star": x_star,       # reused across all obs in this bin
-                "mags":   mags,         # raw mags for ROPE (vectorised)
-                "ids":    ids,          # sample ids for ROPE
-            }
+def load_observations(
+    file_path,
+    merger_mjd: float,
+    dist_mpc: float,
+    dist_err_mpc: float,
+) -> pd.DataFrame:
+    """
+    Load and standardise photometric observations, then compute absolute magnitudes.
 
-    def get(self, band: str, bin_idx: int) -> Optional[Dict]:
-        """Return cached bin data or None if bin is absent/sparse."""
-        return self._cache.get(band, {}).get(int(bin_idx), None)
+    Supports .csv and .json input files.  Absolute magnitudes are derived via
+    ``compute_abs_mag_samples`` (from utils), which is expected to accept
+    array inputs for vectorised computation.
+
+    Parameters
+    ----------
+    file_path : str or Path
+        Path to the photometry file (.csv or .json).
+    merger_mjd : float
+        MJD of the GW merger event.
+    dist_mpc : float
+        Luminosity distance in Mpc.
+    dist_err_mpc : float
+        Uncertainty on the luminosity distance in Mpc.
+
+    Returns
+    -------
+    pd.DataFrame
+        Standardised DataFrame including ``absolute_magnitude`` and
+        ``absolute_magnitude_error`` columns.
+    """
+    path = Path(file_path)
+    logger.info("Loading observations from %s", path)
+
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(path)
+        df["time_after_gw"] = df["time"] - merger_mjd
+    elif suffix == ".json":
+        df = parse_json_photometry(path, merger_mjd)
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+
+    if df.empty:
+        logger.warning("No valid observations loaded from %s", path)
+        return df
+
+    # Vectorised absolute-magnitude computation — compute_abs_mag_samples must
+    # accept 1-D arrays and return (abs_mag_array, abs_err_array).
+    abs_mag, abs_err = compute_abs_mag_samples(  # noqa: F821 (from utils.*)
+        df["magnitude"].to_numpy(),
+        df["e_magnitude"].to_numpy(),
+        dist_mpc=dist_mpc,
+        dist_err_mpc=dist_err_mpc,
+    )
+    df["absolute_magnitude"] = abs_mag
+    df["absolute_magnitude_error"] = abs_err
+
+    return df
 
 
 # ---------------------------------------------------------------------------
-# 2. Vectorised KDE metrics — no Python loops
+# LSST-like cadence downsampling
 # ---------------------------------------------------------------------------
 
-def predictive_tail_kde_fast(
-    cached_bin: Dict,
-    x0: float,
-    sigma: float,
+def preprocess_lsst_like(
+    data_obs: pd.DataFrame,
+    bands: Tuple[str, ...] = ("g-band", "z-band"),
+    time_col: str = "time_after_gw",
+    band_col: str = "filter_mapped",
+    strategy: str = "earliest",
+) -> pd.DataFrame:
+    """
+    Downsample high-cadence data to a standard LSST-like survey cadence.
+
+    Retains at most one observation per (night, band) pair, making
+    over-sampled events (e.g. AT2017gfo) comparable to typical KN candidates.
+
+    Parameters
+    ----------
+    data_obs : pd.DataFrame
+        Raw observational data with time and filter columns.
+    bands : tuple of str
+        Filters to retain.
+    time_col : str
+        Column name for time since merger (days).
+    band_col : str
+        Column name for the mapped photometric band.
+    strategy : {'earliest', 'snr', 'random'}
+        Selection rule when multiple observations fall on the same night:
+        - ``'earliest'``: smallest timestamp.
+        - ``'snr'``: highest signal-to-noise ratio (1 / e_magnitude).
+        - ``'random'``: random draw (seed 42 for reproducibility).
+
+    Returns
+    -------
+    pd.DataFrame
+        Downsampled observations sorted by ``time_col``.
+    """
+    df = data_obs[data_obs[band_col].isin(bands)].copy()
+    df["day"] = np.floor(df[time_col]).astype(int)
+    df = df.sort_values(time_col)
+
+    if strategy == "earliest":
+        df_out = df.groupby(["day", band_col], as_index=False).first()
+
+    elif strategy == "snr":
+        df["snr"] = 1.0 / df["e_magnitude"]
+        df_out = (
+            df.sort_values("snr", ascending=False)
+            .groupby(["day", band_col], as_index=False)
+            .first()
+        )
+        df_out = df_out.drop(columns="snr")
+
+    elif strategy == "random":
+        df_out = df.groupby(["day", band_col], as_index=False).sample(
+            n=1, random_state=42
+        )
+
+    else:
+        raise ValueError("strategy must be 'earliest', 'snr', or 'random'")
+
+    return df_out.sort_values(time_col).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Core scoring: P_tail_KNe and P_near_KNe
+# ---------------------------------------------------------------------------
+
+def predictive_tail_kde(
+    sim_values: np.ndarray,
+    M_obs: float,
+    sigma_obs: float,
     k: float = 1.0,
-    n_uncertainty_samples: int = 100,
+    n_sim: int = 50000,
+    kde: Optional[gaussian_kde] = None,
 ) -> Dict[str, float]:
     """
-    Compute p_tail, prob_near, and uncertainty using precomputed KDE draws.
+    Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
+    distribution (PPD) via KDE.
 
-    Key changes vs original:
-      - x_star already drawn; only noise convolution is new per observation
-      - Charlie's method fully vectorised: (n_uncertainty_samples, n_sim) broadcast
+    Implements the two-sided tail-area probability::
+
+        P_tail_KNe = 2 * min(F_hat, 1 - F_hat)
+
+    and the ROPE-based local consistency score::
+
+        P_near_KNe = Pr(M_rep in [M_obs - k*sigma_obs, M_obs + k*sigma_obs])
+
+    Uncertainty on P_tail_KNe is estimated by sampling N_obs = 100 realisations
+    of M_obs from N(M_obs, sigma_obs) ("Charlie's Method", vectorised).
+
+    A pre-fitted KDE can be supplied via ``kde`` to avoid redundant fitting when
+    multiple observations share the same simulation time bin.
 
     Parameters
     ----------
-    cached_bin : dict
-        Entry from BinKDECache containing 'x_star'.
-    x0 : float
-        Observed magnitude.
-    sigma : float
-        Observational uncertainty.
+    sim_values : np.ndarray
+        Simulated absolute magnitudes from the PPD for the relevant time bin.
+    M_obs : float
+        Observed absolute magnitude (M_obs in paper notation).
+    sigma_obs : float
+        Observational uncertainty on M_obs.
     k : float
-        ROPE half-width in units of sigma.
-    n_uncertainty_samples : int
-        Number of x0 perturbations for uncertainty estimation.
+        ROPE half-width factor (k * sigma_obs).  Paper fiducial: 1.5.
+    n_sim : int
+        Number of Monte Carlo draws for the noise-convolved PPD.
+    kde : gaussian_kde or None
+        Pre-fitted KDE object.  If None, a new KDE is fitted to ``sim_values``.
+
+    Returns
+    -------
+    dict with keys:
+        F_hat        – empirical CDF evaluated at M_obs.
+        p_tail_KNe   – two-sided tail-area probability.
+        p_tail_mean  – mean of P_tail_KNe over M_obs uncertainty samples.
+        p_tail_std   – std  of P_tail_KNe over M_obs uncertainty samples.
+        p_near_KNe   – ROPE-based local consistency score (P_near_KNe).
+
+    Raises
+    ------
+    ValueError
+        If ``sim_values`` is empty or ``sigma_obs`` is non-positive.
     """
-    x_star: np.ndarray = cached_bin["x_star"]          # (n_sim,)  — cached
-    n_sim = len(x_star)
+    sim_values = np.asarray(sim_values)
+    if sim_values.size == 0:
+        raise ValueError("sim_values cannot be empty.")
+    if sigma_obs <= 0:
+        raise ValueError("sigma_obs must be positive.")
 
-    # Noise convolution: Y = X* + ε,  ε ~ N(0, σ)
-    # New noise draw per observation (cheap: just n_sim normals)
-    eps    = np.random.normal(0.0, sigma, size=n_sim)
-    y_dist = x_star + eps                               # (n_sim,)
+    # 1. Build noise-convolved PPD: Y = X* + epsilon, X* ~ KDE, epsilon ~ N(0, sigma_obs)
+    if kde is None:
+        kde = gaussian_kde(sim_values)
+    x_star = kde.resample(n_sim)[0]
+    y_dist = x_star + np.random.normal(0, sigma_obs, size=n_sim)
 
-    # --- Point estimates ---
-    f_hat    = float(np.mean(y_dist <= x0))
-    p_tail   = float(2.0 * min(f_hat, 1.0 - f_hat))
-    prob_near = float(np.mean(np.abs(y_dist - x0) <= k * sigma))
+    # 2. P_tail_KNe — two-sided tail probability at M_obs
+    F_hat = float(np.mean(y_dist <= M_obs))
+    p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
-    # --- Vectorised Charlie's method ---
-    # x0_samples shape: (n_uncertainty_samples, 1)
-    # y_dist     shape: (1, n_sim)
-    # broadcast  shape: (n_uncertainty_samples, n_sim)
-    x0_samples   = np.random.normal(x0, sigma, size=(n_uncertainty_samples, 1))
-    f_hat_matrix = (y_dist[np.newaxis, :] <= x0_samples).mean(axis=1)  # (n_uncertainty_samples,)
-    p_tail_samples = 2.0 * np.minimum(f_hat_matrix, 1.0 - f_hat_matrix)
+    # 3. P_near_KNe — fraction of PPD draws within the ROPE
+    p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
+
+    # 4. Uncertainty on P_tail_KNe via vectorised sampling of M_obs
+    #    N_obs = 100 realisations; broadcast (100,1) vs (n_sim,) -> (100, n_sim)
+    M_obs_samples = np.random.normal(M_obs, sigma_obs, 100)
+    F_hat_samples = (y_dist <= M_obs_samples[:, np.newaxis]).mean(axis=1)
+    p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
 
     return {
-        "F_hat":       f_hat,
-        "p_tail":      p_tail,
+        "F_hat": F_hat,
+        "p_tail_KNe": p_tail_KNe,
         "p_tail_mean": float(np.mean(p_tail_samples)),
-        "p_tail_std":  float(np.std(p_tail_samples)),
-        "prob_near":   prob_near,
+        "p_tail_std": float(np.std(p_tail_samples)),
+        "p_near_KNe": p_near_KNe,
     }
 
 
 # ---------------------------------------------------------------------------
-# 3. Vectorised ROPE filtering — replaces per-row pandas scan
+# ABC diagnostic helpers
 # ---------------------------------------------------------------------------
 
-def compute_consistent_ids_fast(
-    cached_bin: Dict,
+def compute_consistent_ids_anyhit(
+    sim_band: pd.DataFrame,
+    bin_idx: int,
     M_obs: float,
     sigma_obs: float,
     overlap_k: float = 2.0,
 ) -> List:
     """
-    Vectorised ROPE filter using pre-cached numpy arrays.
+    Return simulation IDs whose predicted magnitude falls within the ROPE at
+    the given time bin (conservative "any-hit" criterion).
 
-    Instead of filtering the DataFrame with .loc every call,
-    we operate on the cached numpy arrays directly.
+    The ROPE acceptance kernel is:
+        |M_rep - M_obs| <= overlap_k * sigma_obs
+
+    Parameters
+    ----------
+    sim_band : pd.DataFrame
+        Simulation data for a single photometric band, with ``time_bin``,
+        ``sample_id``, and ``absolute_magnitude`` columns.
+    bin_idx : int
+        Time-bin index to filter on.
+    M_obs : float
+        Observed absolute magnitude.
+    sigma_obs : float
+        Observational uncertainty.
+    overlap_k : float
+        ROPE half-width multiplier (sigma units).
+
+    Returns
+    -------
+    list
+        Unique sample IDs consistent with the ROPE at this epoch.
     """
-    mags: np.ndarray = cached_bin["mags"]   # (n_bin,)  — already numpy
-    ids:  np.ndarray = cached_bin["ids"]    # (n_bin,)
+    sim_bin = sim_band.loc[
+        sim_band["time_bin"] == bin_idx, ["sample_id", "absolute_magnitude"]
+    ]
+    if sim_bin.empty:
+        return []
 
-    rope  = overlap_k * sigma_obs
-    mask  = np.abs(mags - M_obs) <= rope    # vectorised boolean mask
-    return ids[mask].tolist()
+    rope_half_width = overlap_k * sigma_obs
+    inside = np.abs(sim_bin["absolute_magnitude"].to_numpy() - M_obs) <= rope_half_width
+    return sim_bin.loc[inside, "sample_id"].dropna().unique().tolist()
 
 
-# ---------------------------------------------------------------------------
-# 4. Overlap chain (unchanged — already efficient set logic)
-# ---------------------------------------------------------------------------
+def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
+    """
+    Compute the sequential ABC survival diagnostic across observations.
 
-def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict:
-    order  = np.argsort(times)
-    times  = np.asarray(times)[order]
-    sets   = [set(ids_lists[i]) for i in order]
+    For a sequence of per-observation consistent-ID sets S_1, S_2, ..., S_N,
+    this function computes:
+
+    - pairwise overlaps: S_i ∩ S_{i+1}
+    - running survivors: ⋂_{j<=i} S_j  (the set S_t from the paper)
+
+    The survival count |S_t| is monotonically non-increasing by construction.
+
+    Parameters
+    ----------
+    ids_lists : list of lists
+        Per-observation lists of consistent simulation IDs.
+    times : list of float
+        Observation timestamps (days after merger), same order as ids_lists.
+
+    Returns
+    -------
+    dict with keys:
+        times               – sorted observation times.
+        pairwise            – list of dicts with pairwise overlap info.
+        survivors_over_time – list of dicts with cumulative survivors per epoch.
+        final_survivors     – sorted IDs surviving all epochs.
+        final_n_survivors   – count of final survivors.
+    """
+    order = np.argsort(times)
+    times_sorted = np.asarray(times)[order]
+    sets = [set(ids_lists[i]) for i in order]
 
     if not sets:
         return {
-            "times": [], "pairwise": [],
+            "times": [],
+            "pairwise": [],
             "survivors_over_time": [],
-            "final_survivors": [], "final_n_survivors": 0,
+            "final_survivors": [],
+            "final_n_survivors": 0,
         }
 
+    # Initialise running intersection from first observation
     survivors = sets[0].copy()
-    survivors_over_time = [{"t": float(times[0]),
-                            "n_survivors": len(survivors),
-                            "survivor_ids": sorted(survivors)}]
-    pairwise = []
+    survivors_over_time = [{
+        "t": float(times_sorted[0]),
+        "n_survivors": len(survivors),
+        "survivor_ids": sorted(survivors),
+    }]
 
+    pairwise = []
     for i in range(len(sets) - 1):
-        inter = sets[i].intersection(sets[i + 1])
+        # Pairwise: S_i ∩ S_{i+1}
+        inter = sets[i] & sets[i + 1]
         pairwise.append({
-            "t_left":     float(times[i]),
-            "t_right":    float(times[i + 1]),
-            "n_overlap":  len(inter),
+            "t_left": float(times_sorted[i]),
+            "t_right": float(times_sorted[i + 1]),
+            "n_overlap": len(inter),
             "overlap_ids": sorted(inter),
         })
-        survivors = survivors.intersection(sets[i + 1])
+
+        # Cumulative: S_t = S_{t-1} ∩ S_t
+        survivors &= sets[i + 1]
         survivors_over_time.append({
-            "t": float(times[i + 1]),
+            "t": float(times_sorted[i + 1]),
             "n_survivors": len(survivors),
             "survivor_ids": sorted(survivors),
         })
 
     return {
-        "times":               times.tolist(),
-        "pairwise":            pairwise,
+        "times": times_sorted.tolist(),
+        "pairwise": pairwise,
         "survivors_over_time": survivors_over_time,
-        "final_survivors":     sorted(survivors),
-        "final_n_survivors":   len(survivors),
+        "final_survivors": sorted(survivors),
+        "final_n_survivors": len(survivors),
     }
 
 
 # ---------------------------------------------------------------------------
-# 5. Main scorer — accelerated
+# Logit-space cumulative P_tail_KNe scoring
 # ---------------------------------------------------------------------------
 
-def kilonovascorer_v2(
+def binned_stats_cumulative_ptail(
+    metric_df: pd.DataFrame,
+    bin_size: float = 0.2,
+) -> pd.DataFrame:
+    """
+    Aggregate per-observation P_tail_KNe scores into time-binned cumulative scores.
+
+    Within each time bin, individual scores are combined using an
+    inverse-variance weighted mean in logit space (see paper Section 2).
+    The result is then updated sequentially across bins to produce a running
+    cumulative score, also in logit space.
+
+    Logit-space aggregation prevents extreme scores with small absolute
+    uncertainties from dominating the weighted mean — a known pathology of
+    direct probability-space averaging near the [0, 1] boundaries.
+
+    Parameters
+    ----------
+    metric_df : pd.DataFrame
+        Output of ``kilonovascorer``.  Must contain ``obs_time``,
+        ``p_tail_mean``, and ``p_tail_std`` columns.
+    bin_size : float
+        Width of time bins in days.  Should match the scorer's
+        ``time_bin_width`` (default 0.2 d).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per time bin with columns:
+        ``time_bin``, ``time_mid``, ``mean``, ``std``,
+        ``running_mean``, ``running_std``.
+    """
+    bin_edges = np.arange(
+        metric_df["obs_time"].min() - bin_size / 2,
+        metric_df["obs_time"].max() + bin_size,
+        bin_size,
+    )
+    metric_df = metric_df.copy()
+    metric_df["time_bin"] = pd.cut(metric_df["obs_time"], bins=bin_edges)
+
+    binned_stats = (
+        metric_df.groupby("time_bin", observed=True)
+        .apply(ivw_stats_logit)  # noqa: F821 (from utils.*)
+        .reset_index()
+    )
+    binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
+    binned_stats = binned_stats.dropna()
+
+    running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
+        binned_stats["mean"].values,
+        binned_stats["std"].values,
+    )
+    binned_stats["running_mean"] = running_mean
+    binned_stats["running_std"] = running_err
+
+    return binned_stats
+
+
+# ---------------------------------------------------------------------------
+# Main scorer
+# ---------------------------------------------------------------------------
+
+def kilonovascorer_v3(
     data_obs: pd.DataFrame,
     data_sim: pd.DataFrame,
     candidate_name: str,
     time_bin_width: float = 0.2,
     band_list: Tuple[str, ...] = ("g-band", "r-band", "i-band", "z-band"),
-    k_near: float = 1.0,
-    n_kde_sim: int = 50_000,
+    k_near: float = 1.5,
+    n_kde_sim: int = 50000,
     min_sim_points: int = 20,
     overlap_k: float = 2.0,
-    n_uncertainty_samples: int = 100,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Accelerated kilonova scorer (drop-in replacement for kilonovascorer_v1).
+    Score a kilonova candidate against a simulation grid.
 
-    Speedup strategy
-    ----------------
-    Per band:
-      Step A — Pre-group sim_band by time_bin (one O(N) groupby, not O(N) per obs).
-      Step B — Build KDE cache: one gaussian_kde + n_kde_sim draws per bin.
-      Step C — Observation loop uses cached KDE draws + vectorised ROPE mask.
-      Step D — Overlap chain is unchanged (already efficient).
+    For each photometric band and observation, computes:
+
+    - **P_tail_KNe** — two-sided tail probability of M_obs under the
+      noise-convolved PPD (with uncertainty via observation sampling).
+    - **P_near_KNe** — ROPE-based local consistency score.
+    - **ABC survival diagnostic** — sequential intersection of consistent
+      simulation IDs across epochs (|S_t| from paper Section 3).
 
     Parameters
     ----------
-    (identical interface to kilonovascorer_v1)
+    data_obs : pd.DataFrame
+        Observational data.  Required columns: ``filter_mapped``,
+        ``time_after_gw``, ``absolute_magnitude``,
+        ``absolute_magnitude_error``.
+    data_sim : pd.DataFrame
+        Simulation grid.  Required columns: ``filter_mapped``, ``time``,
+        ``absolute_magnitude``, ``sample_id``.
+    candidate_name : str
+        Human-readable identifier for the transient candidate.
+    time_bin_width : float
+        Width of time bins used to match observations to simulations (days).
+    band_list : tuple of str
+        Photometric bands to score.
+    k_near : float
+        ROPE half-width factor for P_near_KNe (paper fiducial: 1.5).
+    n_kde_sim : int
+        Monte Carlo samples for the noise-convolved KDE.
+    min_sim_points : int
+        Minimum number of simulations required in a bin to attempt scoring.
+    overlap_k : float
+        ROPE half-width factor for the ABC diagnostic (sigma units).
+
+    Returns
+    -------
+    results_df : pd.DataFrame
+        Per-observation metrics including P_tail_KNe, P_near_KNe, and ABC
+        diagnostics.
+    summary_df : pd.DataFrame
+        Per-band overlap chain summary.
     """
-    results:               List[Dict[str, Any]] = []
-    overlap_summary_by_band: Dict[str, Any]    = {}
+    results: List[Dict[str, Any]] = []
+    overlap_summary_by_band: Dict[str, Any] = {}
 
     for band in band_list:
+        # 1. Filter data for this band
         sim_band = data_sim[data_sim["filter_mapped"] == band].copy()
         obs_band = data_obs[data_obs["filter_mapped"] == band].copy()
 
         if sim_band.empty or obs_band.empty:
+            logger.debug("No data for band %s — skipping.", band)
             continue
 
-        # ── A. Time binning ──────────────────────────────────────────────
-        t_start = obs_band["time_after_gw"].min() - (time_bin_width / 2)
-        t_end   = obs_band["time_after_gw"].max() + time_bin_width
-        bins    = np.arange(t_start, t_end, time_bin_width)
+        # 2. Assign simulation time bins (computed once per band).
+        #    Bin edges are chosen so that the first and last observations both
+        #    land at the centre of their respective bins:
+        #      left edge  = t_first - bin_width/2
+        #      right edge = t_last  + bin_width/2
+        #    An extra bin_width is added to t_end so np.arange includes the
+        #    final right edge.
+        t_first = obs_band["time_after_gw"].min()
+        t_last  = obs_band["time_after_gw"].max()
+        t_start = t_first - time_bin_width / 2
+        t_end   = t_last  + time_bin_width / 2 + time_bin_width
+        bins = np.arange(t_start, t_end, time_bin_width)
+
+        assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
+        assert bins[-2] < t_last < bins[-1], "Last observation not centred in last bin."
 
         sim_band["time_bin"] = np.digitize(sim_band["time"], bins)
 
-        # ── B. Build KDE cache for this band ────────────────────────────
-        print(f"\n[{band}] Building KDE cache for "
-              f"{sim_band['time_bin'].nunique()} bins …")
-        cache = BinKDECache(n_sim=n_kde_sim, min_sim_points=min_sim_points)
-        cache.build(band, sim_band)
+        # Pre-group simulations by time bin for O(1) lookup per observation
+        sim_groups: Dict[int, pd.DataFrame] = {
+            k: v for k, v in sim_band.groupby("time_bin")
+        }
 
-        # ── C. Observation loop — no iterrows(), no repeated scans ───────
-        obs_band  = obs_band.sort_values("time_after_gw")
+        # Per-band tracking for ABC overlap chain
+        band_times: List[float] = []
+        band_ids_lists: List[List] = []
+        band_row_indices: List[int] = []
 
-        # Extract arrays once — eliminates iterrows() overhead
-        t_arr     = obs_band["time_after_gw"].to_numpy(dtype=float)
-        m_arr     = obs_band["absolute_magnitude"].to_numpy(dtype=float)
-        sig_arr   = obs_band["absolute_magnitude_error"].to_numpy(dtype=float)
+        # 3. Process observations in chronological order
+        obs_band = obs_band.sort_values("time_after_gw")
+        total_obs = len(obs_band)
 
-        band_times:       List[float]      = []
-        band_ids_lists:   List[List]       = []
-        band_row_indices: List[int]        = []
+        for count, obs_row in enumerate(obs_band.itertuples(index=False), start=1):
+            t_obs = float(obs_row.time_after_gw)
+            M_obs = float(obs_row.absolute_magnitude)
+            sigma_obs = float(obs_row.absolute_magnitude_error)
 
-        n_obs = len(t_arr)
-        for idx in range(n_obs):
-            arcade_progress_bar(idx, n_obs)
-
-            t_obs     = t_arr[idx]
-            m_obs     = m_arr[idx]
-            sigma_obs = sig_arr[idx]
-
-            if not (np.isfinite(m_obs) and np.isfinite(sigma_obs)
-                    and sigma_obs > 0):
+            # Skip degenerate observations
+            if not (np.isfinite(M_obs) and np.isfinite(sigma_obs) and sigma_obs > 0):
+                logger.debug("Skipping invalid observation at t=%.3f d.", t_obs)
                 continue
 
-            bin_idx    = int(np.digitize(t_obs, bins))
-            cached_bin = cache.get(band, bin_idx)
+            bin_idx = int(np.digitize(t_obs, bins))
+            sim_bin = sim_groups.get(bin_idx, pd.DataFrame())
 
-            if cached_bin is None:          # sparse or missing bin
+            if len(sim_bin) < min_sim_points:
+                logger.debug(
+                    "Bin %d has %d simulations (< %d) — skipping.",
+                    bin_idx, len(sim_bin), min_sim_points,
+                )
                 continue
 
-            # KDE metrics — reuses cached x_star, only new noise draw
-            metric = predictive_tail_kde_fast(
-                cached_bin,
-                x0=m_obs,
-                sigma=sigma_obs,
+            # 3a. Fit KDE once per unique (band, bin_idx); reuse across observations
+            #     in the same bin to avoid redundant 50 k-sample draws.
+            if not hasattr(sim_groups, "_kde_cache"):
+                sim_groups._kde_cache = {}  # type: ignore[attr-defined]
+            if bin_idx not in sim_groups._kde_cache:  # type: ignore[attr-defined]
+                sim_groups._kde_cache[bin_idx] = gaussian_kde(  # type: ignore[attr-defined]
+                    sim_bin["absolute_magnitude"].to_numpy()
+                )
+            cached_kde = sim_groups._kde_cache[bin_idx]  # type: ignore[attr-defined]
+
+            # 3b. Compute P_tail_KNe and P_near_KNe
+            metric = predictive_tail_kde(
+                sim_bin["absolute_magnitude"].to_numpy(),
+                M_obs=M_obs,
+                sigma_obs=sigma_obs,
                 k=k_near,
-                n_uncertainty_samples=n_uncertainty_samples,
+                n_sim=n_kde_sim,
+                kde=cached_kde,
             )
 
-            # ROPE filter — fully vectorised, no DataFrame scan
-            consistent_ids = compute_consistent_ids_fast(
-                cached_bin,
-                M_obs=m_obs,
+            # 3c. ABC diagnostic — consistent simulation IDs at this epoch
+            consistent_ids = compute_consistent_ids_anyhit(
+                sim_band=sim_band,
+                bin_idx=bin_idx,
+                M_obs=M_obs,
                 sigma_obs=sigma_obs,
                 overlap_k=overlap_k,
             )
 
-            t_low  = float(bins[bin_idx - 1] if bin_idx > 0 else bins[0])
-            t_high = float(bins[bin_idx]     if bin_idx < len(bins) else bins[-1])
+            # 3d. Safe time-bin edge lookup
+            bin_low = float(bins[bin_idx - 1] if bin_idx > 0 else bins[0])
+            bin_high = float(bins[bin_idx] if bin_idx < len(bins) else bins[-1])
 
-            row = {
-                "candidate_name":       candidate_name,
-                "band":                 band,
-                "obs_time":             t_obs,
-                "time_bin_low":         t_low,
-                "time_bin_high":        t_high,
-                "observed_mag":         m_obs,
-                "observed_mag_err":     sigma_obs,
-                "p_tail":               metric["p_tail"],
-                "p_tail_mean":          metric["p_tail_mean"],
-                "p_tail_std":           metric["p_tail_std"],
-                "prob_near":            metric["prob_near"],
-                "n_sim_bin":            int(len(cached_bin["mags"])),
-                "n_consistent_lcs":     int(len(consistent_ids)),
-                "consistent_ids":       consistent_ids,
-                "overlap_with_next_n":  np.nan,
-                "overlap_with_next_ids":[],
-                "running_survivors_n":  np.nan,
-                "running_survivors_ids":[],
+            row: Dict[str, Any] = {
+                "candidate_name": candidate_name,
+                "band": band,
+                "obs_time": t_obs,
+                "time_bin_low": bin_low,
+                "time_bin_high": bin_high,
+                "observed_mag": M_obs,
+                "observed_mag_err": sigma_obs,
+                "p_tail_KNe": metric["p_tail_KNe"],
+                "p_tail_mean": metric["p_tail_mean"],
+                "p_tail_std": metric["p_tail_std"],
+                "p_near_KNe": metric["p_near_KNe"],
+                "n_sim_bin": len(sim_bin),
+                "n_consistent_lcs": len(consistent_ids),
+                "consistent_ids": consistent_ids,
+                # ABC overlap fields — populated in post-processing step 4
+                "overlap_with_next_n": np.nan,
+                "overlap_with_next_ids": [],
+                "running_survivors_n": np.nan,
+                "running_survivors_ids": [],
             }
 
             results.append(row)
             band_times.append(t_obs)
             band_ids_lists.append(consistent_ids)
             band_row_indices.append(len(results) - 1)
+            arcade_progress_bar(count, total_obs, bar_length=50)
 
-        arcade_progress_bar(n_obs, n_obs)
-
-        # ── D. Overlap chain (post-processing, unchanged) ────────────────
+        # 4. Post-processing: compute ABC overlap chain for this band
         if band_ids_lists:
             chain = overlap_chain(band_ids_lists, band_times)
             overlap_summary_by_band[band] = chain
 
+            # Map running survivors back to per-observation rows
             for j, surv in enumerate(chain["survivors_over_time"]):
-                ri = band_row_indices[j]
-                results[ri]["running_survivors_n"]   = int(surv["n_survivors"])
-                results[ri]["running_survivors_ids"] = surv["survivor_ids"]
+                idx = band_row_indices[j]
+                results[idx]["running_survivors_n"] = int(surv["n_survivors"])
+                results[idx]["running_survivors_ids"] = surv["survivor_ids"]
 
+            # Map pairwise overlaps to the left-hand observation of each pair
             for j, pw in enumerate(chain.get("pairwise", [])):
-                ri = band_row_indices[j]
-                results[ri]["overlap_with_next_n"]   = int(pw["n_overlap"])
-                results[ri]["overlap_with_next_ids"] = pw["overlap_ids"]
+                idx_left = band_row_indices[j]
+                results[idx_left]["overlap_with_next_n"] = int(pw["n_overlap"])
+                results[idx_left]["overlap_with_next_ids"] = pw["overlap_ids"]
 
     return pd.DataFrame(results), pd.DataFrame(overlap_summary_by_band)
