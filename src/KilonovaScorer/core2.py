@@ -247,24 +247,34 @@ def predictive_tail_kde(
     sim_values: np.ndarray,
     M_obs: float,
     sigma_obs: float,
-    k: float = 1.0,
+    k: float = 1.5,
     n_sim: int = 50000,
+    n_obs: int = 100,
     kde: Optional[gaussian_kde] = None,
 ) -> Dict[str, float]:
     """
     Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
     distribution (PPD) via KDE.
 
-    Implements the two-sided tail-area probability::
+    Implements the two-sided tail-area probability (paper eq. 2)::
 
-        P_tail_KNe = 2 * min(F_hat, 1 - F_hat)
+        F(M_obs) = Pr(M_rep <= M_obs)
+        P_tail_KNe = 2 * min(F(M_obs), 1 - F(M_obs))
 
-    and the ROPE-based local consistency score::
+    and the ROPE-based local consistency score (paper eq. 4)::
 
         P_near_KNe = Pr(M_rep in [M_obs - k*sigma_obs, M_obs + k*sigma_obs])
 
-    Uncertainty on P_tail_KNe is estimated by sampling N_obs = 100 realisations
-    of M_obs from N(M_obs, sigma_obs) ("Charlie's Method", vectorised).
+    Both are evaluated on the noise-convolved PPD:
+        Y = X* + epsilon,  X* ~ KDE(sim_values),  epsilon ~ N(0, sigma_obs)
+
+    Uncertainty on P_tail_KNe is propagated by sampling N_obs realisations of
+    M_obs from N(M_obs, sigma_obs), as described in the paper.  The broadcast
+    comparison (N_obs, 1) vs (n_sim,) -> (N_obs, n_sim) is fully vectorised.
+
+    P_near_KNe is a *local*, per-observation score and is intentionally not
+    aggregated across bands or epochs (paper Section 2).  Only P_tail_KNe
+    (via p_tail_mean / p_tail_std) feeds into the cumulative logit-space score.
 
     A pre-fitted KDE can be supplied via ``kde`` to avoid redundant fitting when
     multiple observations share the same simulation time bin.
@@ -274,24 +284,27 @@ def predictive_tail_kde(
     sim_values : np.ndarray
         Simulated absolute magnitudes from the PPD for the relevant time bin.
     M_obs : float
-        Observed absolute magnitude (M_obs in paper notation).
+        Observed absolute magnitude (paper notation: M_obs).
     sigma_obs : float
-        Observational uncertainty on M_obs.
+        Observational uncertainty on M_obs (paper notation: sigma_obs).
     k : float
-        ROPE half-width factor (k * sigma_obs).  Paper fiducial: 1.5.
+        ROPE half-width factor.  Paper fiducial value: 1.5.
     n_sim : int
         Number of Monte Carlo draws for the noise-convolved PPD.
+    n_obs : int
+        Number of M_obs realisations for P_tail_KNe uncertainty estimation.
+        Paper value: N_obs = 100.
     kde : gaussian_kde or None
         Pre-fitted KDE object.  If None, a new KDE is fitted to ``sim_values``.
 
     Returns
     -------
     dict with keys:
-        F_hat        – empirical CDF evaluated at M_obs.
-        p_tail_KNe   – two-sided tail-area probability.
-        p_tail_mean  – mean of P_tail_KNe over M_obs uncertainty samples.
-        p_tail_std   – std  of P_tail_KNe over M_obs uncertainty samples.
-        p_near_KNe   – ROPE-based local consistency score (P_near_KNe).
+        F_hat        – empirical CDF F(M_obs) under the noise-convolved PPD.
+        p_tail_KNe   – two-sided tail probability at M_obs (point estimate).
+        p_tail_mean  – mean P_tail_KNe over n_obs M_obs uncertainty samples.
+        p_tail_std   – std  P_tail_KNe over n_obs M_obs uncertainty samples.
+        p_near_KNe   – ROPE-based local consistency score P_near_KNe.
 
     Raises
     ------
@@ -310,16 +323,17 @@ def predictive_tail_kde(
     x_star = kde.resample(n_sim)[0]
     y_dist = x_star + np.random.normal(0, sigma_obs, size=n_sim)
 
-    # 2. P_tail_KNe — two-sided tail probability at M_obs
+    # 2. P_tail_KNe — two-sided tail probability at M_obs (paper eq. 2)
     F_hat = float(np.mean(y_dist <= M_obs))
     p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
-    # 3. P_near_KNe — fraction of PPD draws within the ROPE
+    # 3. P_near_KNe — fraction of noise-convolved PPD draws within the ROPE
+    #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
     p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
 
-    # 4. Uncertainty on P_tail_KNe via vectorised sampling of M_obs
-    #    N_obs = 100 realisations; broadcast (100,1) vs (n_sim,) -> (100, n_sim)
-    M_obs_samples = np.random.normal(M_obs, sigma_obs, 100)
+    # 4. P_tail_KNe uncertainty — sample N_obs realisations of M_obs (paper Section 2)
+    #    Broadcast: (n_obs, 1) vs (n_sim,) -> (n_obs, n_sim)
+    M_obs_samples = np.random.normal(M_obs, sigma_obs, n_obs)
     F_hat_samples = (y_dist <= M_obs_samples[:, np.newaxis]).mean(axis=1)
     p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
 
@@ -617,6 +631,9 @@ def kilonovascorer_v3(
         band_ids_lists: List[List] = []
         band_row_indices: List[int] = []
 
+        # KDE cache: fitted once per bin_idx, reused across observations in the same bin
+        kde_cache: Dict[int, gaussian_kde] = {}
+
         # 3. Process observations in chronological order
         obs_band = obs_band.sort_values("time_after_gw")
         total_obs = len(obs_band)
@@ -641,23 +658,21 @@ def kilonovascorer_v3(
                 )
                 continue
 
-            # 3a. Fit KDE once per unique (band, bin_idx); reuse across observations
-            #     in the same bin to avoid redundant 50 k-sample draws.
-            if not hasattr(sim_groups, "_kde_cache"):
-                sim_groups._kde_cache = {}  # type: ignore[attr-defined]
-            if bin_idx not in sim_groups._kde_cache:  # type: ignore[attr-defined]
-                sim_groups._kde_cache[bin_idx] = gaussian_kde(  # type: ignore[attr-defined]
+            # 3a. Fit KDE once per bin; reuse if another observation shares the same bin
+            if bin_idx not in kde_cache:
+                kde_cache[bin_idx] = gaussian_kde(
                     sim_bin["absolute_magnitude"].to_numpy()
                 )
-            cached_kde = sim_groups._kde_cache[bin_idx]  # type: ignore[attr-defined]
+            cached_kde = kde_cache[bin_idx]
 
-            # 3b. Compute P_tail_KNe and P_near_KNe
+            # 3b. Compute P_tail_KNe and P_near_KNe (paper eqs. 2 and 4)
             metric = predictive_tail_kde(
                 sim_bin["absolute_magnitude"].to_numpy(),
                 M_obs=M_obs,
                 sigma_obs=sigma_obs,
                 k=k_near,
                 n_sim=n_kde_sim,
+                n_obs=100,      # N_obs = 100 per paper Section 2
                 kde=cached_kde,
             )
 
