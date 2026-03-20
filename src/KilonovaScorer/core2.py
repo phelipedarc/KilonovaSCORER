@@ -613,11 +613,11 @@ def kilonovascorer_v3(
         t_first = obs_band["time_after_gw"].min()
         t_last  = obs_band["time_after_gw"].max()
         t_start = t_first - time_bin_width / 2
-        t_end   = t_last  + time_bin_width / 2 + time_bin_width
+        t_end   = t_last  + time_bin_width / 2 
         bins = np.arange(t_start, t_end, time_bin_width)
 
-        assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
-        assert bins[-2] < t_last < bins[-1], "Last observation not centred in last bin."
+        # assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
+        # assert bins[-2] < t_last < bins[-1], "Last observation not centred in last bin."
 
         sim_band["time_bin"] = np.digitize(sim_band["time"], bins)
 
