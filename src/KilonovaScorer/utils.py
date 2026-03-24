@@ -157,6 +157,13 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
         ``std``   – propagated uncertainty (probability space).
         ``count`` – number of valid scores used.
     """
+    #Handling the zero scores:
+    # inside ivw_stats_logit, before computing weights:
+    valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
+    group = group[valid]
+    if group.empty:
+        return pd.Series({"mean": 0.0, "std": 0.0})
+      
     p = group["p_tail_mean"].to_numpy()
     s = group["p_tail_std"].to_numpy()
 
