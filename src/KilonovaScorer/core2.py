@@ -507,9 +507,10 @@ def binned_stats_cumulative_ptail(
         ``time_bin``, ``time_mid``, ``mean``, ``std``,
         ``running_mean``, ``running_std``.
     """
+  #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
     bin_edges = np.arange(
         metric_df["obs_time"].min() - bin_size / 2,
-        metric_df["obs_time"].max() + bin_size,
+        metric_df["obs_time"].max() + bin_size / 2,
         bin_size,
     )
     metric_df = metric_df.copy()
