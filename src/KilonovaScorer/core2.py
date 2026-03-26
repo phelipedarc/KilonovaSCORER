@@ -508,9 +508,10 @@ def binned_stats_cumulative_ptail(
         ``running_mean``, ``running_std``.
     """
   #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
+  #modidy back to +  bin_size
     bin_edges = np.arange(
         metric_df["obs_time"].min() - bin_size / 2,
-        metric_df["obs_time"].max() + bin_size / 2,
+        metric_df["obs_time"].max() + bin_size ,
         bin_size,
     )
     metric_df = metric_df.copy()
@@ -614,7 +615,7 @@ def kilonovascorer_v3(
         t_first = obs_band["time_after_gw"].min()
         t_last  = obs_band["time_after_gw"].max()
         t_start = t_first - time_bin_width / 2
-        t_end   = t_last  + time_bin_width / 2 
+        t_end   = t_last  + time_bin_width  
         bins = np.arange(t_start, t_end, time_bin_width)
 
         # assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
