@@ -146,6 +146,137 @@ def plot_simulations_LCS(data_sim_all,BIN_WIDTH = 0.2, save_png=True):
         plt.savefig(f'simulated_LCs.png',dpi=300)
     plt.show()
 
+def plot_simulations_LCS_V1(
+    data_sim_all,
+    BIN_WIDTH=0.2,
+    band_colors=None,   # <-- NEW
+    cmap="tab10",       # fallback colormap
+    fill_alpha=0.25,
+    line_alpha=1.0,
+    save_png=True
+):
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+
+    # -----------------------------
+    # 1) Fast mean/std per (band, bin)
+    # -----------------------------
+    t = data_sim_all["time"].to_numpy(copy=False)
+    m = data_sim_all["absolute_magnitude"].to_numpy(copy=False)
+    band_arr = data_sim_all["band"].to_numpy(copy=False)
+
+    mask = np.isfinite(t) & np.isfinite(m) & pd.notna(band_arr)
+    t, m, band_arr = t[mask], m[mask], band_arr[mask]
+
+    tmin = t.min()
+    time_idx = np.floor((t - tmin) / BIN_WIDTH).astype(np.int32)
+    n_time = int(time_idx.max()) + 1
+
+    band_codes, band_levels = pd.factorize(band_arr, sort=True)
+    band_codes = band_codes.astype(np.int32)
+    n_bands = len(band_levels)
+
+    key = band_codes * n_time + time_idx
+    size = n_bands * n_time
+
+    m64 = m.astype(np.float64, copy=False)
+
+    counts = np.bincount(key, minlength=size).astype(np.int64)
+    sum_m = np.bincount(key, weights=m64, minlength=size)
+    sum_m2 = np.bincount(key, weights=m64 * m64, minlength=size)
+
+    mean = np.full(size, np.nan)
+    std = np.full(size, np.nan)
+
+    nz = counts > 0
+    mean[nz] = sum_m[nz] / counts[nz]
+    var = (sum_m2[nz] / counts[nz]) - mean[nz]**2
+    var = np.maximum(var, 0.0)
+    std[nz] = np.sqrt(var)
+
+    mean = mean.reshape(n_bands, n_time)
+    std = std.reshape(n_bands, n_time)
+    counts = counts.reshape(n_bands, n_time)
+
+    time_centers = tmin + (np.arange(n_time) + 0.5) * BIN_WIDTH
+
+    # -----------------------------
+    # 2) Color handling (NEW)
+    # -----------------------------
+    if band_colors is None:
+        cmap_obj = plt.get_cmap(cmap)
+        band_colors = {
+            band: cmap_obj(i % cmap_obj.N)
+            for i, band in enumerate(band_levels)
+        }
+    else:
+        # ensure all bands have a color
+        missing = [b for b in band_levels if b not in band_colors]
+        if missing:
+            cmap_obj = plt.get_cmap(cmap)
+            for i, band in enumerate(missing):
+                band_colors[band] = cmap_obj(i % cmap_obj.N)
+
+    # -----------------------------
+    # 3) Plot
+    # -----------------------------
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=200)
+
+    for b_idx, band in enumerate(band_levels):
+        mu = mean[b_idx]
+        sd = std[b_idx]
+        ok = np.isfinite(mu) & np.isfinite(sd) & (counts[b_idx] > 0)
+
+        if not np.any(ok):
+            continue
+
+        x = time_centers[ok]
+        y = mu[ok]
+        ylo = y - sd[ok]
+        yhi = y + sd[ok]
+
+        color = band_colors[band]
+
+        ax.fill_between(
+            x, ylo, yhi,
+            color=color,
+            alpha=fill_alpha,
+            linewidth=0
+        )
+
+        ax.plot(
+            x, y,
+            color=color,
+            linewidth=1.5,
+            alpha=line_alpha,
+            label=str(band)
+        )
+
+    # -----------------------------
+    # 4) Styling
+    # -----------------------------
+    ax.set_xlabel("Time [days]")
+    ax.set_ylabel("Simulated Absolute magnitude [AB]")
+    ax.invert_yaxis()
+    ax.set_xlim(0, 10)
+    ax.set_ylim(-10, -20)
+
+    ax.xaxis.set_major_locator(MultipleLocator(1.0))
+    ax.xaxis.set_minor_locator(MultipleLocator(0.2))
+
+    ax.set_axisbelow(True)
+    ax.grid(which="major", alpha=0.25)
+    ax.grid(which="minor", color="#d8c6ff", linewidth=0.6, alpha=0.6)
+
+    ax.legend(title="Band", ncols=2, fontsize=11)
+    plt.tight_layout()
+
+    if save_png:
+        plt.savefig("simulated_LCs.png", dpi=300)
+
+    plt.show()
     
 def plot_observational_data_Apparent(data_obs):
     # 1. Define your marker and color mapping
