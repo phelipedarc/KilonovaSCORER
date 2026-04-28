@@ -54,6 +54,8 @@ or running the script
 simulating_kne_pop.py --nsim 100000 
 ```
 
+Simulations are also available for download at: https://zenodo.org/records/19824266
+
 ## Core Functionality
 
 The current beta release provides the following high-level interface:
