@@ -523,7 +523,21 @@ def binned_stats_cumulative_ptail(
         .reset_index()
     )
     binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
-    binned_stats = binned_stats.dropna()
+    # Narrowed from a bare .dropna(): with how="any" a single NaN in ANY
+    # column deleted the whole bin.  That is how all-zero bins used to vanish —
+    # ivw_stats_logit's old two-key early return left count = NaN under
+    # groupby.apply, and the bin was dropped on the strength of that missing
+    # field alone, never because its score was unusable.  Restricting the
+    # subset to the two columns the running score actually consumes means a
+    # future schema addition cannot silently start deleting bins again.
+    binned_stats = binned_stats.dropna(subset=["mean", "std"])
+
+    if binned_stats.empty:
+        # Nothing usable.  Return the empty frame with the expected columns
+        # rather than letting an empty array reach the sequential updater.
+        binned_stats["running_mean"] = []
+        binned_stats["running_std"] = []
+        return binned_stats
 
     running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
         binned_stats["mean"].values,

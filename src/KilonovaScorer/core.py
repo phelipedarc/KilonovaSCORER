@@ -356,7 +356,7 @@ def binned_stats_cumulative_ptail(metric_df,bin_size=0.2):
     metric_df['time_bin'] = pd.cut(metric_df['obs_time'], bins=bin_edges)
     binned_stats = metric_df.groupby('time_bin', observed=True).apply(ivw_stats_logit).reset_index()
     binned_stats['time_mid'] = binned_stats['time_bin'].apply(lambda x: x.mid)
-    binned_stats= binned_stats.dropna()
+    binned_stats = binned_stats.dropna(subset=["mean", "std"])
     running_mean, running_err = calculate_sequential_score_logit(
         binned_stats['mean'].values, 
         binned_stats['std'].values
