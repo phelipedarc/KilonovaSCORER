@@ -336,100 +336,9 @@ def predictive_tail_kde(
 
     m = np.asarray(sim_values, dtype=float)
 
-    # 1. Noise-convolved PPD, evaluated in CLOSED FORM rather than sampled.
-    #
-    #    The KDE over {m_i} is a finite Gaussian mixture, and convolving it with
-    #    the observational noise widens each component (variances add):
-    #
-    #        p(M_rep) = (1/N) sum_i N(M_rep | m_i, s^2),  s = sqrt(h^2 + sigma_obs^2)
-    #
-    #    Integration is linear, so the CDF of the mixture is the mixture of the
-    #    component CDFs — no Gaussianity is assumed for the total, which is
-    #    skewed and sometimes bimodal:
-    #
-    #        F(M_obs) = (1/N) sum_i Phi((M_obs - m_i) / s)        (paper eq. 6)
-    #
-    #    This is the same integral the Monte Carlo above was estimating, solved
-    #    exactly: condition on the mixture component and enumerate instead of
-    #    sampling (Rao-Blackwellisation), and the sampling variance goes to
-    #    zero.  The n_sim draws carried a standard error on F_hat of
-    #    ~sqrt(F(1-F)/n_sim) ≈ 0.002 at n_sim = 50000, which the logit transform
-    #    then amplified near the boundaries where dz/dp = 1/(p(1-p)) is large —
-    #    a real contributor to score jitter, now gone.  It is also cheaper: one
-    #    vectorised Phi over the simulations in the bin, instead of drawing and
-    #    comparing n_sim samples.
-    #
-    #    BANDWIDTH h = 0, so s = sigma_obs and gaussian_kde is not used at all.
-    #    The kernel exists to smooth N samples into a *density*; we need a CDF,
-    #    and the empirical CDF is already well defined and unbiased (smoothing
-    #    trades that for an O(h^2) bias in exchange for a variance reduction
-    #    that is negligible, since a CDF's variance is bounded by F(1-F)/N
-    #    however it is estimated — Azzalini 1981).  sigma_obs already does the
-    #    smoothing.  And h > 0 is a bias in a familiar direction: it widens the
-    #    reference beyond the truth, making every observation look less extreme.
-    #    At sigma_obs = 0.02, Scott's rule inflates the reference width by
-    #    ~1069%, so precisely the best-measured observations are damaged most.
     s = float(sigma_obs)
     phi = ndtr((M_obs - m) / s)          # per-simulation component CDFs
 
-    # 2. SELECTION CONDITIONING (IMPROVEMENTS.md 19).
-    #
-    #    An observation exists only because it was DETECTED, which requires
-    #    M_obs < M_lim.  The simulated population is under no such constraint:
-    #    the prior spans m_ej from 1e-4 to 0.1 Msun, so most of it is far too
-    #    faint to ever be seen.  Scoring a detected object against a population
-    #    dominated by undetectable draws forces a real kilonova into the bright
-    #    tail, and 2*min(F, 1-F) reads a bright tail as inconsistency.
-    #
-    #    Measured on held-out kilonovae that ARE genuine by construction, a
-    #    calibrated method must return P_tail ~ U(0,1) with median 0.5.  With no
-    #    selection modelled it returns a median of 0.204 at 300 Mpc / 0.5 d and
-    #    0.106 at 150 Mpc / 3 d, with 24.5% and 47.3% of real kilonovae scoring
-    #    below 0.1.  The controlling variable is M_lim = m_lim - mu, not
-    #    distance: the paper's own LSST validation sits at M_lim = -11.5 where
-    #    the cut is nearly inert, which is why it never surfaced there.
-    #
-    #    THE FIX IS A DENOMINATOR, NOT A REWEIGHTING.  Write the selection out.
-    #    Take simulation i, measure it with noise s, keep it if the measurement
-    #    clears the limit.  The density of the KEPT measurement is
-    #
-    #        p(m_hat | kept) = sum_i N(m_hat | m_i, s^2) * 1[m_hat <= M_lim]
-    #                          / sum_i Phi((M_lim - m_i)/s)
-    #
-    #    The detection probability appears BY ITSELF, as the normaliser — it
-    #    arises from integrating the component over the detectable range.
-    #    Integrating up to M_obs gives
-    #
-    #        F(M_obs) = sum_i Phi((M_obs - m_i)/s) / sum_i Phi((M_lim - m_i)/s)
-    #
-    #    Only the denominator changes: the head-count N becomes the DETECTED
-    #    count, tallied with the same fractional votes.  Numerator = expected
-    #    number of simulations producing a measurement at least as bright as
-    #    M_obs; denominator = expected number producing a detectable measurement
-    #    at all.  Set M_lim = +inf and every Phi in the denominator becomes 1,
-    #    the denominator collapses to N, and the unconditioned form is recovered
-    #    exactly — so this composes with the closed form rather than replacing
-    #    it.  Nothing is subsetted or reweighted; the probability is renormalised
-    #    onto the detectable range.
-    #
-    #    NOT the doubly-weighted form.  Weighting the numerator by the same
-    #    detection probability applies the selection twice.  The boundary test
-    #    settles it: at M_obs = M_lim every detectable simulation is at or
-    #    brighter than the observation, so F MUST be exactly 1.  This form gives
-    #    1 identically; sum(w^2)/sum(w) is strictly less than 1 whenever the
-    #    weights differ, so it is not a CDF and its P_tail cannot be uniform.
-    #
-    #    NOT the hard cut either, which discards the partial information in
-    #    simulations near the limit and made 3 of 4 real candidates unscoreable.
-    #    Mean KS against U(0,1) over eight survey depths:
-    #        none 0.358 | hard cut 0.196 | doubly-weighted 0.195 | THIS 0.058
-    #
-    #    BEHAVIOURAL CONSEQUENCE worth knowing: conditioning pushes near-limit
-    #    detections toward F -> 1, and the two-sided fold turns that into a low
-    #    P_tail.  That is correct under the conditioned null — an object at your
-    #    limit really is at the extreme faint end of what you could have seen —
-    #    but it means the faintest detections score down, the mirror image of
-    #    the bias being fixed.
     n_eff = float(m.size)
     use_limit = M_lim is not None and np.isfinite(M_lim)
     limit_requested = use_limit
@@ -439,90 +348,38 @@ def predictive_tail_kde(
         w_sum = float(w.sum())
         if w_sum > 0.0:
             F_hat = float(np.clip(phi.sum() / w_sum, 0.0, 1.0))
-            # Kish effective sample size: how many simulations the conditioned
-            # reference is really worth.  A shallow limit can leave this tiny
-            # even when the raw count is large, which is what a plain row count
-            # cannot catch.
             n_eff = float(w_sum ** 2 / np.sum(w ** 2))
         else:
-            # NOTHING in the bin is detectable at this depth — as at 300 Mpc
-            # beyond 3 d, where the whole grid is invisible.  Do NOT quietly
-            # fall back to the unconditioned reference: that is the biased
-            # estimator this conditioning exists to replace, and returning it
-            # here would hand back a confident number precisely where the grid
-            # has nothing to say.  Report it as unscoreable instead.
             limit_degenerate = True
             n_eff = 0.0
             use_limit = False
     if not use_limit:
         F_hat = float(phi.mean())
 
-    # Do NOT clamp M_lim to max(M_lim, M_obs).  That sets the truncation exactly
-    # at the observation, making F = 1 and P_tail = 0 — silently converting every
-    # low-S/N detection into a hard rejection.  An observation fainter than its
-    # own derived limit is a data-quality problem, not something to paper over.
-
     # 3. P_tail_KNe — two-sided tail probability at M_obs (paper eq. 7)
     p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
-    # Insufficient reference population: below min_n_eff the conditioned
-    # reference is too thin to support a score.  Report NaN rather than a
-    # number the grid cannot back.
-    # The min_n_eff gate applies ONLY when conditioning is in use.  With no
-    # limit the reference is the whole grid, n_eff == N, and bin occupancy is
-    # already governed by the scorer's min_sim_points — gating here as well
-    # would change the unconditioned path, which must stay exactly as it was.
     scoreable = True
     if limit_requested:
         scoreable = (not limit_degenerate) and n_eff >= float(min_n_eff)
     if not scoreable:
         p_tail_KNe = float("nan")
 
-    # 3. P_tail_KNe uncertainty — the finite-grid standard error of F_hat.
-    #
-    #    This replaces the N_obs jitter loop, which drew M_obs realisations from
-    #    N(M_obs, sigma_obs) and took their spread.  That applied sigma_obs a
-    #    SECOND time: blurring the observation and broadening the population are
-    #    the same operation seen from two ends,
-    #
-    #        E_eta[ (1/N) sum_i Phi((M_obs + eta - m_i)/h) ]
-    #          == (1/N) sum_i Phi((M_obs - m_i)/sqrt(h^2 + sigma_obs^2))
-    #
-    #    with eta ~ N(0, sigma_obs^2), so the jitter was silently scoring against
-    #    a population of width sqrt(h^2 + 2 sigma_obs^2) — an inflated reference
-    #    that makes candidates look more kilonova-consistent than they are.
-    #    M_obs is data: a fixed, known number and a limit of integration in
-    #    eq. (6), not a distribution.  There is one telescope pointing at one
-    #    object; a second sigma_obs posits a second measurement never made.
-    #
-    #    Nor was the resulting spread an uncertainty.  It is flat in the number
-    #    of simulations (0.177 -> 0.193 as N goes 625 -> 10,000) where a genuine
-    #    estimator error falls as 1/sqrt(N).  What it measured was the width of
-    #    the null distribution of P_tail, uniform on (0, 1) by the probability
-    #    integral transform, which is not supposed to shrink.
-    #
-    #    What IS uncertain is F_hat itself: the m_i are a finite draw from the
-    #    prior over ejecta parameters.  F_hat is a plain mean of the phi_i, so
-    #    its standard error is sd(phi)/sqrt(N) — free in the same pass, and it
-    #    does fall as 1/sqrt(N).  The two-sided fold has |dP_tail/dF| = 2.
-    #    Under selection conditioning the estimator is a ratio, so its standard
-    #    error picks up the denominator's variability too.  The delta method for
-    #    R = A/B with A = mean(phi), B = mean(w) gives
-    #        var(R) ~ (1/B^2) [ var(A) - 2R cov(A,B) + R^2 var(B) ] / N
-    #    which is computed directly from the per-simulation terms below.  With
-    #    no limit, w == 1 identically, so var(B) = cov(A,B) = 0 and this reduces
-    #    exactly to sd(phi)/sqrt(N).
     n_grid = m.size
     if n_grid > 1:
         if use_limit:
-            R = phi.mean() / w.mean()
-            resid = (phi - R * w) / w.mean()
-            se_F = float(resid.std(ddof=1) / np.sqrt(n_grid))
+            R_raw = float(phi.sum() / w.sum())
+            if 0.0 < R_raw < 1.0:
+                resid = (phi - R_raw * w) / w.mean()
+                se_F = float(resid.std(ddof=1) / np.sqrt(n_grid))
+            else:
+                se_F = 0.0
         else:
             se_F = float(phi.std(ddof=1) / np.sqrt(n_grid))
     else:
         se_F = 0.0
-    p_tail_std = 2.0 * se_F
+    # P_tail is a probability; its standard error cannot exceed the range.
+    p_tail_std = float(min(2.0 * se_F, 1.0))
     if not scoreable:
         p_tail_std = float("nan")
 
@@ -682,6 +539,9 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
 def binned_stats_cumulative_ptail(
     metric_df: pd.DataFrame,
     bin_size: float = 0.2,
+    method: str = "stouffer",
+    weight_col: Optional[str] = None,
+    rho: float = 0.0,
 ) -> pd.DataFrame:
     """
     Aggregate per-observation P_tail_KNe scores into time-binned cumulative scores.
@@ -713,6 +573,14 @@ def binned_stats_cumulative_ptail(
     """
   #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
   #modidy back to +  bin_size
+    if method not in ("stouffer", "brown", "ivw"):
+        raise ValueError("method must be 'stouffer', 'brown' or 'ivw'.")
+    if method == "brown" and not rho:
+        logger.warning(
+            "method='brown' with rho=0 reduces exactly to Fisher, which is the "
+            "worst-calibrated option under correlated epochs. Supply rho."
+        )
+
     bin_edges = np.arange(
         metric_df["obs_time"].min() - bin_size / 2,
         metric_df["obs_time"].max() + bin_size ,
@@ -721,17 +589,59 @@ def binned_stats_cumulative_ptail(
     metric_df = metric_df.copy()
     metric_df["time_bin"] = pd.cut(metric_df["obs_time"], bins=bin_edges)
 
+    if method == "ivw":
+        # Retained for comparison and backwards compatibility only.  See the
+        # notes above stouffer_combine in utils.py for why it is not the default.
+        binned_stats = (
+            metric_df.groupby("time_bin", observed=True)
+            .apply(ivw_stats_logit)  # noqa: F821 (from utils.*)
+            .reset_index()
+        )
+        binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
+        binned_stats = binned_stats.dropna()
+
+        running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
+            binned_stats["mean"].values,
+            binned_stats["std"].values,
+        )
+        binned_stats["running_mean"] = running_mean
+        binned_stats["running_std"] = running_err
+        return binned_stats
+
+    # p-value combination.  Per-bin first, then a cumulative combination that
+    # goes back to the raw per-epoch p-values rather than re-combining bin
+    # scores.
+    combiner = brown_combine if method == "brown" else stouffer_combine  # noqa: F821
     binned_stats = (
         metric_df.groupby("time_bin", observed=True)
-        .apply(ivw_stats_logit)  # noqa: F821 (from utils.*)
+        .apply(lambda g: stouffer_stats(  # noqa: F821 (from utils.*)
+            g, weight_col=weight_col, rho=rho, combiner=combiner))
         .reset_index()
     )
     binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
-    binned_stats = binned_stats.dropna()
+    binned_stats = binned_stats.dropna(subset=["mean"])
 
-    running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
-        binned_stats["mean"].values,
-        binned_stats["std"].values,
+    if binned_stats.empty:
+        binned_stats["running_mean"] = []
+        binned_stats["running_std"] = []
+        return binned_stats
+
+    # Chronological order, and the raw epochs behind each surviving bin.
+    binned_stats = binned_stats.sort_values("time_mid").reset_index(drop=True)
+    by_bin = {k: v for k, v in metric_df.groupby("time_bin", observed=True)}
+    p_by_bin, w_by_bin = [], []
+    for tb in binned_stats["time_bin"]:
+        g = by_bin[tb]
+        p_by_bin.append(g["p_tail_mean"].to_numpy(dtype=float))
+        w_by_bin.append(
+            g[weight_col].to_numpy(dtype=float)
+            if weight_col is not None and weight_col in g else None
+        )
+    if all(w is None for w in w_by_bin):
+        w_by_bin = None
+
+    running_mean, running_err = calculate_sequential_score_stouffer(  # noqa: F821
+        p_by_bin, weights_by_bin=w_by_bin, rho=rho, combiner=combiner,
     )
     binned_stats["running_mean"] = running_mean
     binned_stats["running_std"] = running_err

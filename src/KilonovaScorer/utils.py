@@ -16,7 +16,10 @@ import logging
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from typing import List, Optional
+
+from scipy.special import expit, logit, ndtr, ndtri
+from scipy.stats import chi2
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +189,353 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
 
     return pd.Series({"mean": mean, "std": std, "count": len(p)})
 
+
+# ---------------------------------------------------------------------------
+# Stouffer combination of per-epoch p-values
+# ---------------------------------------------------------------------------
+#
+# WHY NOT INVERSE-VARIANCE WEIGHTING
+# ----------------------------------
+# IVW assumes several noisy measurements of ONE SHARED QUANTITY, each with a
+# known variance; then sum(w_i z_i)/sum(w_i) with w_i = 1/sigma_i^2 is the
+# minimum-variance unbiased combination.  That is not the situation here.
+#
+# Under the null each P_tail_i is a P-VALUE, uniform on (0, 1) — this is the
+# probability integral transform, measured holding at KS 0.018.  Six uniforms
+# are not six noisy estimates of a common mean.  There is no shared parameter to
+# average toward, so IVW's optimality theorem simply does not apply, and the
+# framework has no slot for a per-observation uncertainty.  That is why every
+# candidate definition of ``p_tail_std`` felt arbitrary: they are three answers
+# to a question that should not be asked.  Under the null, a badly-measured
+# epoch's p-value is not "noisier" — it is exactly as uniform as a well-measured
+# one.
+#
+# It is not merely unmotivated, it is harmful.  Measured on held-out kilonovae,
+# where the null is true by construction and a correct combiner must return a
+# uniform score:
+#
+#     per-epoch P_tail (the input)         KS 0.018
+#     IVW logit, p_tail_std weights        KS 0.204   <- production
+#     Fisher (assumes independence)        KS 0.159
+#     IVW logit, EQUAL weights             KS 0.137
+#     Stouffer Z                           KS 0.115
+#     Brown (correlation-corrected Fisher) KS 0.050
+#
+# The combiner was an order of magnitude worse than its own input, and deleting
+# the weights entirely improved it.  Two further defects compound this: the delta
+# method sigma_z = sigma_p/(p(1-p)) is a first-order linearisation requiring
+# sigma_p << p(1-p), which fails outright at small P_tail (at P_tail = 0.0055 the
+# measured sigma_p = 0.0094 EXCEEDS the probability); and with sigma_obs
+# identical at every row the weight still varied 67x with where the observation
+# sat relative to the population — backwards, so that the point most strongly
+# rejecting the hypothesis got weight 0.34 while a mildly informative one got
+# 22.9.
+#
+# WHAT STOUFFER CHANGES
+# ---------------------
+# Two changes, one cosmetic and one that is the whole point.
+#
+#   now       z_i = logit(p_i)          Z = sum(w_i z_i) / sum(w_i)      AVERAGE
+#   proposed  z_i = Phi^-1(1 - p_i)     Z = sum(w_i z_i) / sqrt(sum(w_i^2))  SUM
+#
+# The link function logit -> Phi^-1 is cosmetic; the two agree to a scale factor
+# (logit(p) ~ 1.70 * Phi^-1(p)) across the range that matters.  It is swapped
+# because Phi^-1 is the inverse of the NORMAL CDF, which is what makes the
+# normaliser exact.
+#
+# The normaliser sum(w) -> sqrt(sum(w^2)) is the real change.  Dividing by
+# sum(w) produces a weighted average — a number with no known null distribution.
+# Dividing by sqrt(sum(w^2)) produces a STANDARDISED TEST STATISTIC.  Under the
+# null each p_i is uniform, so z_i = Phi^-1(1 - p_i) is exactly N(0, 1).  A
+# weighted sum of independent normals is normal with mean sum(w_i)*0 = 0 and
+# variance sum(w_i^2)*1, so
+#
+#     Z ~ N(0, 1)   EXACTLY, for ANY fixed positive weights.
+#
+# The weights appear in the numerator and the normaliser and cancel.  Under IVW
+# the weights WERE the calibration, and getting them wrong miscalibrated the
+# output — which is exactly what was measured.  Under Stouffer the weights
+# cannot break calibration; they affect only POWER, i.e. how well real kilonovae
+# separate from contaminants.  That converts an unanswerable question ("what is
+# the uncertainty on a p-value?") into a measurable one ("which weights best
+# separate kilonovae from supernovae?").
+#
+# WHY NOT BROWN, WHICH MEASURED BEST
+# ----------------------------------
+# Brown's method reaches KS 0.050 by moment-matching a scaled chi-square to the
+# observed covariance of -2 ln p.  It needs that covariance estimated across the
+# ENSEMBLE of candidates, which a per-candidate function cannot see, and the
+# better-founded alternative — deriving the correlation from the simulation grid
+# at the candidate's own cadence — is unimplemented and untested.  Stouffer with
+# equal weights is the step that is safe and provable today; ``rho`` below is the
+# opt-in hook for the correlation correction when it is ready.
+
+
+def stouffer_combine(
+    p,
+    weights=None,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Combine p-values by the weighted Stouffer method.
+
+    Parameters
+    ----------
+    p : array-like
+        Per-epoch p-values (``p_tail_mean``).  Non-finite entries are dropped.
+        Zeros are KEPT and clamped to ``eps``: a categorically-rejected epoch is
+        the strongest evidence available, not missing data.
+    weights : array-like or None
+        Per-epoch weights.  ``None`` (default) means equal weights.  Any fixed
+        positive weights leave the null distribution of Z exactly standard
+        normal, so this cannot affect calibration — only power.
+    eps : float
+        Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
+    rho : float
+        Exchangeable inter-epoch correlation, used to correct the normaliser::
+
+            Var(sum w_i z_i) = sum_i sum_j w_i w_j rho_ij
+
+        Epochs of one candidate are genuinely correlated — same object, smooth
+        light curve, one shared distance — with a measured mean of 0.284.
+        Positive correlation makes the true variance larger than ``sum(w^2)``,
+        so the default ``rho = 0`` is OVERCONFIDENT by a known direction.  It is
+        left at 0 because the well-founded estimate of rho (from the grid, at
+        this candidate's own cadence) is not implemented yet, and borrowing one
+        number from the literature would be a guess wearing a measurement's
+        clothes.
+
+    Returns
+    -------
+    dict with keys ``p_combined``, ``Z``, ``count``.
+        ``p_combined`` is itself a p-value on (0, 1) — small means inconsistent
+        with the kilonova hypothesis, the same orientation as ``P_tail``.
+    """
+    p = np.asarray(p, dtype=float)
+    finite = np.isfinite(p)
+    p = p[finite]
+
+    if weights is None:
+        w = np.ones(p.size, dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)[finite]
+        bad = ~np.isfinite(w) | (w <= 0)
+        w = np.where(bad, 0.0, w)
+
+    keep = w > 0
+    p, w = p[keep], w[keep]
+
+    if p.size == 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": 0}
+
+    p_clipped = np.clip(p, eps, 1.0 - eps)
+    z = ndtri(1.0 - p_clipped)          # uniform in -> standard normal out
+
+    num = float(np.sum(w * z))
+    var = float(np.sum(w ** 2))
+    if rho:
+        # cross-terms: sum_{i != j} w_i w_j = (sum w)^2 - sum w^2
+        cross = float(np.sum(w) ** 2 - np.sum(w ** 2))
+        var = var + float(rho) * cross
+    if not np.isfinite(var) or var <= 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": int(p.size)}
+
+    Z = num / np.sqrt(var)
+    return {
+        "p_combined": float(ndtr(-Z)),   # 1 - Phi(Z), computed stably
+        "Z": float(Z),
+        "count": int(p.size),
+    }
+
+
+def brown_combine(
+    p,
+    weights=None,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Combine p-values by Brown's method — Fisher, moment-matched for correlation.
+
+    Fisher's statistic ``X2 = -2 sum ln(p_i)`` is chi2(2k) under independence.
+    Brown (1975) rescales it for correlated p-values by matching the first two
+    moments of a scaled chi-square::
+
+        X2 / c ~ chi2(f),   c = Var(X2) / (2 E[X2]),   f = 2 E[X2]^2 / Var(X2)
+
+    with ``E[X2] = 2k`` and ``Var(X2) = 4k + sum_{i!=j} cov(-2 ln p_i, -2 ln p_j)``.
+    The covariance uses the Kost & McDermott (2002) polynomial in the underlying
+    correlation, which refines Brown's original fit::
+
+        cov ~ 3.263 rho + 0.710 rho^2 + 0.027 rho^3
+
+    ``f`` is the EFFECTIVE NUMBER OF INDEPENDENT EPOCHS, which is the useful
+    diagnostic this method produces for free.
+
+    WHEN TO PREFER THIS OVER STOUFFER.  Measured on correlated epochs with both
+    methods given the same rho, Brown is the better calibrated of the two —
+    KS 0.0210 vs 0.0259 at rho = 0.06, and 0.0617 vs 0.0695 at rho = 0.26.  If
+    calibration is the only criterion, use this.
+
+    THREE REASONS IT IS NOT THE DEFAULT.
+
+    1. It needs ``rho``, and with ``rho = 0`` it reduces EXACTLY to Fisher —
+       which is the worst option of all under real correlation (KS 0.1547 at
+       rho = 0.26, against 0.1141 for Stouffer with no correction at all).  So
+       running this without a correlation estimate is worse than not using it.
+       Most of Brown's published advantage is the correlation correction, not
+       Fisher's combination rule.
+    2. It is far more sensitive to a single very small p-value.  With one
+       corrupted photometric point among six good epochs, the median score fell
+       by 7.1x under Brown against 2.7x under correlated Stouffer.  That
+       sensitivity is a virtue against a genuine outlier epoch and a liability
+       against a bad subtraction, which a real-time stream produces routinely.
+    3. There is no natural slot for weights.  Stouffer takes arbitrary positive
+       weights with its null distribution exactly preserved, which is where the
+       per-epoch informativeness implied by ``M_lim`` has to go.  ``weights`` is
+       accepted here and IGNORED, for signature compatibility only.
+
+    Returns
+    -------
+    dict with keys ``p_combined``, ``X2``, ``f`` (effective dof), ``count``.
+    """
+    p = np.asarray(p, dtype=float)
+    p = p[np.isfinite(p)]
+    if p.size == 0:
+        return {"p_combined": np.nan, "X2": np.nan, "f": np.nan, "count": 0}
+
+    k = int(p.size)
+    X2 = float(-2.0 * np.log(np.clip(p, eps, 1.0)).sum())
+    E = 2.0 * k
+    r = float(rho)
+    cov = 3.263 * r + 0.710 * r ** 2 + 0.027 * r ** 3
+    Var = 4.0 * k + k * (k - 1) * cov
+    if not np.isfinite(Var) or Var <= 0:
+        Var = 4.0 * k                       # fall back to independence
+    c = Var / (2.0 * E)
+    f = 2.0 * E ** 2 / Var
+    return {
+        "p_combined": float(chi2.sf(X2 / c, f)),
+        "X2": X2,
+        "f": float(f),
+        "count": k,
+    }
+
+
+def stouffer_stats(
+    group: pd.DataFrame,
+    eps: float = 1e-4,
+    weight_col: Optional[str] = None,
+    rho: float = 0.0,
+    combiner=None,
+) -> pd.Series:
+    """
+    Per-time-bin Stouffer combination, shaped as a drop-in for
+    :func:`ivw_stats_logit`.
+
+    Parameters
+    ----------
+    group : pd.DataFrame
+        Subset of the metrics DataFrame for a single time bin.  Must contain
+        ``p_tail_mean``.  ``p_tail_std`` is neither required nor read — that is
+        the point of the change.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+    weight_col : str or None
+        Column holding per-epoch weights.  ``None`` means equal weights, which
+        is the only choice justified so far; see the module notes above.
+
+    Returns
+    -------
+    pd.Series
+        ``mean``  – the combined p-value for this bin.
+        ``std``   – standard error of the epoch spread about the mean, i.e. how
+                    much the epochs in this bin disagree.  This is NOT a
+                    propagated measurement error and is 0.0 for a single epoch;
+                    nothing downstream weights by it.
+        ``count`` – number of epochs combined.
+
+        All return paths carry all three keys, so ``groupby(...).apply(...)``
+        cannot introduce a spurious NaN column for ``dropna`` to act on.
+    """
+    p = group["p_tail_mean"].to_numpy(dtype=float)
+    w = (group[weight_col].to_numpy(dtype=float)
+         if weight_col is not None and weight_col in group else None)
+
+    combine = stouffer_combine if combiner is None else combiner
+    res = combine(p, weights=w, eps=eps, rho=rho)
+    if res["count"] == 0:
+        return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
+
+    finite = p[np.isfinite(p)]
+    spread = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+              if finite.size > 1 else 0.0)
+    return pd.Series({
+        "mean": res["p_combined"],
+        "std": spread,
+        "count": res["count"],
+    })
+
+
+def calculate_sequential_score_stouffer(
+    p_by_bin,
+    weights_by_bin=None,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+    combiner=None,
+):
+    """
+    Cumulative score after each time bin, by Stouffer combination.
+
+    The running score at bin ``k`` combines every epoch from bins ``0..k``
+    directly from their per-epoch p-values, rather than re-combining
+    already-combined bin scores.  Combining p-values is associative only if the
+    inputs stay uniform, and a combined p-value is uniform but no longer
+    independent of its own components, so going back to the raw epochs is both
+    simpler and exactly calibrated at every ``k``.
+
+    Parameters
+    ----------
+    p_by_bin : sequence of array-like
+        Per-epoch p-values, grouped by time bin, in chronological order.
+    weights_by_bin : sequence of array-like or None
+        Matching per-epoch weights.  ``None`` means equal weights throughout.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+
+    Returns
+    -------
+    running_score : np.ndarray
+        Cumulative combined p-value after each bin.
+    running_err : np.ndarray
+        Standard error of the epoch spread accumulated so far.  Reported for
+        schema compatibility; it is a dispersion, not a propagated error, and
+        nothing consumes it as a weight.
+    """
+    n = len(p_by_bin)
+    running_score = np.full(n, np.nan)
+    running_err = np.full(n, np.nan)
+
+    combine = stouffer_combine if combiner is None else combiner
+    acc_p: List[float] = []
+    acc_w: List[float] = []
+    for i in range(n):
+        acc_p.extend(np.asarray(p_by_bin[i], dtype=float).ravel().tolist())
+        if weights_by_bin is None:
+            acc_w.extend([1.0] * np.asarray(p_by_bin[i]).size)
+        else:
+            acc_w.extend(np.asarray(weights_by_bin[i], dtype=float).ravel().tolist())
+
+        res = combine(acc_p, weights=acc_w, eps=eps, rho=rho)
+        running_score[i] = res["p_combined"]
+
+        finite = np.asarray(acc_p, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        running_err[i] = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+                          if finite.size > 1 else 0.0)
+
+    return running_score, running_err
 
 # ---------------------------------------------------------------------------
 # Sequential logit-space cumulative score update
