@@ -252,6 +252,8 @@ def predictive_tail_kde(
     n_sim: int = 50000,
     n_obs: int = 100,
     kde: Optional[gaussian_kde] = None,
+    M_lim: Optional[float] = None,
+    min_n_eff: float = 20.0,
 ) -> Dict[str, float]:
     """
     Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
@@ -369,10 +371,112 @@ def predictive_tail_kde(
     #    ~1069%, so precisely the best-measured observations are damaged most.
     s = float(sigma_obs)
     phi = ndtr((M_obs - m) / s)          # per-simulation component CDFs
-    F_hat = float(phi.mean())
 
-    # 2. P_tail_KNe — two-sided tail probability at M_obs (paper eq. 7)
+    # 2. SELECTION CONDITIONING (IMPROVEMENTS.md 19).
+    #
+    #    An observation exists only because it was DETECTED, which requires
+    #    M_obs < M_lim.  The simulated population is under no such constraint:
+    #    the prior spans m_ej from 1e-4 to 0.1 Msun, so most of it is far too
+    #    faint to ever be seen.  Scoring a detected object against a population
+    #    dominated by undetectable draws forces a real kilonova into the bright
+    #    tail, and 2*min(F, 1-F) reads a bright tail as inconsistency.
+    #
+    #    Measured on held-out kilonovae that ARE genuine by construction, a
+    #    calibrated method must return P_tail ~ U(0,1) with median 0.5.  With no
+    #    selection modelled it returns a median of 0.204 at 300 Mpc / 0.5 d and
+    #    0.106 at 150 Mpc / 3 d, with 24.5% and 47.3% of real kilonovae scoring
+    #    below 0.1.  The controlling variable is M_lim = m_lim - mu, not
+    #    distance: the paper's own LSST validation sits at M_lim = -11.5 where
+    #    the cut is nearly inert, which is why it never surfaced there.
+    #
+    #    THE FIX IS A DENOMINATOR, NOT A REWEIGHTING.  Write the selection out.
+    #    Take simulation i, measure it with noise s, keep it if the measurement
+    #    clears the limit.  The density of the KEPT measurement is
+    #
+    #        p(m_hat | kept) = sum_i N(m_hat | m_i, s^2) * 1[m_hat <= M_lim]
+    #                          / sum_i Phi((M_lim - m_i)/s)
+    #
+    #    The detection probability appears BY ITSELF, as the normaliser — it
+    #    arises from integrating the component over the detectable range.
+    #    Integrating up to M_obs gives
+    #
+    #        F(M_obs) = sum_i Phi((M_obs - m_i)/s) / sum_i Phi((M_lim - m_i)/s)
+    #
+    #    Only the denominator changes: the head-count N becomes the DETECTED
+    #    count, tallied with the same fractional votes.  Numerator = expected
+    #    number of simulations producing a measurement at least as bright as
+    #    M_obs; denominator = expected number producing a detectable measurement
+    #    at all.  Set M_lim = +inf and every Phi in the denominator becomes 1,
+    #    the denominator collapses to N, and the unconditioned form is recovered
+    #    exactly — so this composes with the closed form rather than replacing
+    #    it.  Nothing is subsetted or reweighted; the probability is renormalised
+    #    onto the detectable range.
+    #
+    #    NOT the doubly-weighted form.  Weighting the numerator by the same
+    #    detection probability applies the selection twice.  The boundary test
+    #    settles it: at M_obs = M_lim every detectable simulation is at or
+    #    brighter than the observation, so F MUST be exactly 1.  This form gives
+    #    1 identically; sum(w^2)/sum(w) is strictly less than 1 whenever the
+    #    weights differ, so it is not a CDF and its P_tail cannot be uniform.
+    #
+    #    NOT the hard cut either, which discards the partial information in
+    #    simulations near the limit and made 3 of 4 real candidates unscoreable.
+    #    Mean KS against U(0,1) over eight survey depths:
+    #        none 0.358 | hard cut 0.196 | doubly-weighted 0.195 | THIS 0.058
+    #
+    #    BEHAVIOURAL CONSEQUENCE worth knowing: conditioning pushes near-limit
+    #    detections toward F -> 1, and the two-sided fold turns that into a low
+    #    P_tail.  That is correct under the conditioned null — an object at your
+    #    limit really is at the extreme faint end of what you could have seen —
+    #    but it means the faintest detections score down, the mirror image of
+    #    the bias being fixed.
+    n_eff = float(m.size)
+    use_limit = M_lim is not None and np.isfinite(M_lim)
+    limit_requested = use_limit
+    limit_degenerate = False
+    if use_limit:
+        w = ndtr((float(M_lim) - m) / s)      # Pr(simulation i is detectable)
+        w_sum = float(w.sum())
+        if w_sum > 0.0:
+            F_hat = float(np.clip(phi.sum() / w_sum, 0.0, 1.0))
+            # Kish effective sample size: how many simulations the conditioned
+            # reference is really worth.  A shallow limit can leave this tiny
+            # even when the raw count is large, which is what a plain row count
+            # cannot catch.
+            n_eff = float(w_sum ** 2 / np.sum(w ** 2))
+        else:
+            # NOTHING in the bin is detectable at this depth — as at 300 Mpc
+            # beyond 3 d, where the whole grid is invisible.  Do NOT quietly
+            # fall back to the unconditioned reference: that is the biased
+            # estimator this conditioning exists to replace, and returning it
+            # here would hand back a confident number precisely where the grid
+            # has nothing to say.  Report it as unscoreable instead.
+            limit_degenerate = True
+            n_eff = 0.0
+            use_limit = False
+    if not use_limit:
+        F_hat = float(phi.mean())
+
+    # Do NOT clamp M_lim to max(M_lim, M_obs).  That sets the truncation exactly
+    # at the observation, making F = 1 and P_tail = 0 — silently converting every
+    # low-S/N detection into a hard rejection.  An observation fainter than its
+    # own derived limit is a data-quality problem, not something to paper over.
+
+    # 3. P_tail_KNe — two-sided tail probability at M_obs (paper eq. 7)
     p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
+
+    # Insufficient reference population: below min_n_eff the conditioned
+    # reference is too thin to support a score.  Report NaN rather than a
+    # number the grid cannot back.
+    # The min_n_eff gate applies ONLY when conditioning is in use.  With no
+    # limit the reference is the whole grid, n_eff == N, and bin occupancy is
+    # already governed by the scorer's min_sim_points — gating here as well
+    # would change the unconditioned path, which must stay exactly as it was.
+    scoreable = True
+    if limit_requested:
+        scoreable = (not limit_degenerate) and n_eff >= float(min_n_eff)
+    if not scoreable:
+        p_tail_KNe = float("nan")
 
     # 3. P_tail_KNe uncertainty — the finite-grid standard error of F_hat.
     #
@@ -401,9 +505,26 @@ def predictive_tail_kde(
     #    prior over ejecta parameters.  F_hat is a plain mean of the phi_i, so
     #    its standard error is sd(phi)/sqrt(N) — free in the same pass, and it
     #    does fall as 1/sqrt(N).  The two-sided fold has |dP_tail/dF| = 2.
+    #    Under selection conditioning the estimator is a ratio, so its standard
+    #    error picks up the denominator's variability too.  The delta method for
+    #    R = A/B with A = mean(phi), B = mean(w) gives
+    #        var(R) ~ (1/B^2) [ var(A) - 2R cov(A,B) + R^2 var(B) ] / N
+    #    which is computed directly from the per-simulation terms below.  With
+    #    no limit, w == 1 identically, so var(B) = cov(A,B) = 0 and this reduces
+    #    exactly to sd(phi)/sqrt(N).
     n_grid = m.size
-    se_F = float(phi.std(ddof=1) / np.sqrt(n_grid)) if n_grid > 1 else 0.0
+    if n_grid > 1:
+        if use_limit:
+            R = phi.mean() / w.mean()
+            resid = (phi - R * w) / w.mean()
+            se_F = float(resid.std(ddof=1) / np.sqrt(n_grid))
+        else:
+            se_F = float(phi.std(ddof=1) / np.sqrt(n_grid))
+    else:
+        se_F = 0.0
     p_tail_std = 2.0 * se_F
+    if not scoreable:
+        p_tail_std = float("nan")
 
     # 4. P_near_KNe — ROPE mass, likewise a difference of two mixture CDFs
     #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
@@ -421,6 +542,11 @@ def predictive_tail_kde(
         "p_tail_mean": p_tail_KNe,
         "p_tail_std": p_tail_std,
         "p_near_KNe": p_near_KNe,
+        # Effective size of the reference actually used.  Equals N when
+        # unconditioned; the Kish n_eff of the detection weights when a limit is
+        # supplied.  Use this, not a raw row count, to gate scorability.
+        "n_eff": n_eff,
+        "scoreable": bool(scoreable),
     }
 
 
@@ -627,6 +753,9 @@ def kilonovascorer_v3(
     n_kde_sim: int = 50000,
     min_sim_points: int = 20,
     overlap_k: float = 2.0,
+    M_lim: Optional[float] = None,
+    M_lim_col: str = "limiting_absolute_magnitude",
+    min_n_eff: float = 20.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -663,6 +792,27 @@ def kilonovascorer_v3(
         Minimum number of simulations required in a bin to attempt scoring.
     overlap_k : float
         ROPE half-width factor for the ABC diagnostic (sigma units).
+    M_lim : float or None
+        Limiting ABSOLUTE magnitude, ``M_lim = m_lim - mu``, used to condition
+        the reference population on detectability (IMPROVEMENTS.md 19).  A
+        scalar applies to every observation.  ``None`` (default) leaves the
+        reference unconditioned, reproducing the previous behaviour exactly.
+
+        Depth is a property of the exposure, so per-observation values are
+        strongly preferred over a scalar — supply them via ``M_lim_col``.
+        Deriving ``m_lim`` from each detection's own S/N is deliberately left to
+        the caller: it needs facility metadata (the pipeline's sigma threshold,
+        an S/N cap) that this package does not have, and reading a 5-sigma depth
+        as 3-sigma is a 0.555 mag systematic error per facility.
+    M_lim_col : str
+        Column of ``data_obs`` holding a per-observation limiting absolute
+        magnitude.  Used when present; falls back to the ``M_lim`` scalar, then
+        to no conditioning.  Non-finite entries fall back the same way.
+    min_n_eff : float
+        Minimum Kish effective sample size for the conditioned reference.  Below
+        it the observation is reported with NaN scores rather than a number the
+        grid cannot support — at 400 Mpc a 10,000-sample grid can leave ~130
+        usable simulations, and at 300 Mpc past 3 d, none at all.
 
     Returns
     -------
@@ -722,6 +872,13 @@ def kilonovascorer_v3(
             M_obs = float(obs_row.absolute_magnitude)
             sigma_obs = float(obs_row.absolute_magnitude_error)
 
+            # Depth is a property of the exposure, so it is per-observation.
+            M_lim_row = getattr(obs_row, M_lim_col, None)
+            if M_lim_row is None or not np.isfinite(M_lim_row):
+                M_lim_row = M_lim
+            if M_lim_row is not None and not np.isfinite(M_lim_row):
+                M_lim_row = None
+
             # Skip degenerate observations
             if not (np.isfinite(M_obs) and np.isfinite(sigma_obs) and sigma_obs > 0):
                 logger.debug("Skipping invalid observation at t=%.3f d.", t_obs)
@@ -745,6 +902,8 @@ def kilonovascorer_v3(
                 M_obs=M_obs,
                 sigma_obs=sigma_obs,
                 k=k_near,
+                M_lim=M_lim_row,
+                min_n_eff=min_n_eff,
             )
 
             # 3b. ABC diagnostic — consistent simulation IDs at this epoch
@@ -772,6 +931,9 @@ def kilonovascorer_v3(
                 "p_tail_mean": metric["p_tail_mean"],
                 "p_tail_std": metric["p_tail_std"],
                 "p_near_KNe": metric["p_near_KNe"],
+                "M_lim": float(M_lim_row) if M_lim_row is not None else np.nan,
+                "n_eff": metric["n_eff"],
+                "scoreable": metric["scoreable"],
                 "n_sim_bin": len(sim_bin),
                 "n_consistent_lcs": len(consistent_ids),
                 "consistent_ids": consistent_ids,
