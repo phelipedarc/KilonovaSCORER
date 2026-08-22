@@ -5,5 +5,5 @@ build/
 *.egg-info/
 .venv/
 .DS_Store
-docs/
 trove_tests/
+docs/
