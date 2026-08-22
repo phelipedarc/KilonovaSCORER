@@ -34,6 +34,7 @@ def compute_abs_mag_samples(
     dist_mpc: float,
     dist_err_mpc: float,
     n_samples: int = 5000,
+    return_components: bool = False,
 ):
     """
     Convert apparent magnitude(s) to absolute magnitude via Monte Carlo sampling.
@@ -59,6 +60,9 @@ def compute_abs_mag_samples(
         Uncertainty on the luminosity distance in Mpc.
     n_samples : int
         Number of Monte Carlo draws per observation.
+    return_components : bool
+        Also return the two terms the total is built from.  ``False`` (default)
+        preserves the original two-value return exactly.
 
     Returns
     -------
@@ -66,6 +70,13 @@ def compute_abs_mag_samples(
         Mean absolute magnitude(s).  np.nan for invalid inputs.
     abs_mag_std : float or np.ndarray
         Standard deviation of absolute magnitude(s).  np.nan for invalid inputs.
+    abs_mag_std_phot : float or np.ndarray
+        Returned only when ``return_components``.  The PHOTOMETRIC term alone,
+        i.e. ``app_mag_err``: independent per observation.
+    sigma_mu : float
+        Returned only when ``return_components``.  The distance-modulus
+        uncertainty: ONE number for the whole candidate, identical at every
+        epoch.
 
     Notes
     -----
@@ -73,6 +84,26 @@ def compute_abs_mag_samples(
     draws is shared across all rows (same distance realisation), while
     apparent-magnitude noise is drawn independently per row.  This correctly
     reflects that the distance uncertainty is a global systematic.
+
+    WHY THE SPLIT MATTERS, AND WHAT IT IS NOT
+    -----------------------------------------
+    ``abs_mag_std`` is the correct MARGINAL uncertainty on one observation:
+    ``Var = sigma_phot^2 + sigma_mu^2``, and a ``P_tail`` computed with it is a
+    correctly calibrated per-epoch p-value.  Nothing about the per-epoch number
+    is wrong, and this function's contract is unchanged.
+
+    What it cannot express is that ``sigma_mu`` is the SAME DRAW at every epoch.
+    Downstream, ``predictive_tail_kde`` consumes ``abs_mag_std`` as independent
+    per-epoch noise, so a shared systematic is counted once per epoch and the
+    correlation it induces is invisible to the combiner.  On AT2017gfo
+    (38.589 +/- 6.997 Mpc) that is 0.394 mag of distance against 0.060 mag of
+    photometry -- **97.7% of the variance, and 100% of it shared** -- which
+    leaves the per-epoch p-values calibrated but the COMBINED score miscalibrated
+    by 4-6x (REPORT.md Part X).
+
+    Returning the components lets a caller do better: score with ``sigma_phot``
+    and handle ``sigma_mu`` once per candidate.  See ``estimate_rho`` and
+    ``simulate_null_zsum`` in core2.py.
     """
     scalar_input = np.ndim(app_mag) == 0
 
@@ -88,9 +119,22 @@ def compute_abs_mag_samples(
     abs_mag_std  = np.full(n_obs, np.nan)
 
     # Global distance validation
+    def _out(mean, std, phot, sig_mu):
+        if scalar_input:
+            mean, std = float(mean[0]), float(std[0])
+            phot = float(phot[0])
+        if return_components:
+            return mean, std, phot, float(sig_mu)
+        return mean, std
+
+    # The photometric term needs no Monte Carlo: the distance modulus is
+    # additive, so it shifts the absolute magnitude without touching its
+    # photometric spread.  sigma_phot in absolute magnitude IS app_mag_err.
+    abs_mag_std_phot = np.where(np.isfinite(app_mag), app_mag_err, np.nan)
+
     if not np.isfinite(dist_mpc) or dist_mpc <= 0:
         logger.warning("Invalid distance dist_mpc=%.3f — returning NaN.", dist_mpc)
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
     # Sample distance modulus (shared across all observations — distance is a
     # global systematic, not an independent draw per row)
@@ -103,10 +147,13 @@ def compute_abs_mag_samples(
             "dist_err_mpc=%.3f.  Returning NaN.",
             dist_mpc, dist_err_mpc,
         )
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
     n_valid = len(D_samples)
     mu_samples = 5.0 * np.log10(D_samples) - 5.0  # shape (n_valid,)
+    # The shared systematic, as one number.  Measured from the same draws the
+    # totals are built from, so it is consistent with them by construction.
+    sigma_mu = float(np.std(mu_samples))
 
     for i in range(n_obs):
         if not np.isfinite(app_mag[i]):
@@ -119,9 +166,7 @@ def compute_abs_mag_samples(
         abs_mag_mean[i] = np.mean(abs_samples)
         abs_mag_std[i]  = np.std(abs_samples)
 
-    if scalar_input:
-        return float(abs_mag_mean[0]), float(abs_mag_std[0])
-    return abs_mag_mean, abs_mag_std
+    return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, sigma_mu)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +210,23 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
     valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
     group = group[valid]
     if group.empty:
-        return pd.Series({"mean": 0.0, "std": 0.0})
+        # Must carry the SAME three keys as every other return path.  This
+        # branch previously returned a two-key Series {"mean", "std"}, and
+        # pandas' groupby.apply only assembles a DataFrame when the Series it
+        # collects share an index -- so as soon as one bin was fully filtered
+        # out and another was not, the result came back as a Series of Series
+        # and the caller died on `binned_stats["mean"]` with KeyError: 'mean'.
+        # That fired on exactly the objects this combiner should reject most
+        # confidently (every epoch p_tail_mean == 0), 44 of 250 simulated
+        # SN IIn/Ibn at four nights.  Returning NaN rather than 0.0 matches the
+        # `len(p) == 0` branch below and lets the caller's dropna() drop the
+        # bin, which is what the filter above already intends; it changes no
+        # number this function has ever successfully produced.
+        #
+        # The filter itself -- dropping p_tail_mean == 0 epochs that do carry
+        # rejecting power -- is a separate defect, fixed on branch
+        # `zero-epochs-handling`, not here.
+        return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
       
     p = group["p_tail_mean"].to_numpy()
     s = group["p_tail_std"].to_numpy()
@@ -260,15 +321,26 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
 # the uncertainty on a p-value?") into a measurable one ("which weights best
 # separate kilonovae from supernovae?").
 #
-# WHY NOT BROWN, WHICH MEASURED BEST
-# ----------------------------------
-# Brown's method reaches KS 0.050 by moment-matching a scaled chi-square to the
-# observed covariance of -2 ln p.  It needs that covariance estimated across the
-# ENSEMBLE of candidates, which a per-candidate function cannot see, and the
-# better-founded alternative — deriving the correlation from the simulation grid
-# at the candidate's own cadence — is unimplemented and untested.  Stouffer with
-# equal weights is the step that is safe and provable today; ``rho`` below is the
-# opt-in hook for the correlation correction when it is ready.
+# WHY NOT BROWN
+# -------------
+# An earlier version of this note was headed "WHY NOT BROWN, WHICH MEASURED
+# BEST", on the strength of Brown reaching KS 0.050 against Stouffer's 0.115 in
+# an early single-seed test where only Brown was given a correlation estimate.
+# That comparison was not like-for-like and its conclusion has been withdrawn.
+# Given the SAME grid-derived rho, Stouffer is better calibrated in all 36
+# end-to-end cells tested (3 cadences x 4 rho settings x 3 seeds); at 4 nights
+# and rho_hat = 0.390 the means are 0.0639 for Stouffer against 0.0780 for
+# Brown.  Brown wins on POWER instead (pooled AUC 0.9380 vs 0.9290), and
+# degrades faster when rho is misspecified.  See ``brown_combine`` for the full
+# table and ``trove_tests/docs/WEIGHTS.md`` for the harness.
+#
+# Brown remains non-default because it needs ``rho`` and collapses to plain
+# Fisher without one, because it is far more sensitive to a single corrupted
+# p-value, and because it has no slot for weights.  ``rho`` below is the opt-in
+# hook for the correlation correction on either method — and note that
+# supplying it matters far more than any weighting choice: at rho = 0.39 the
+# correction moves the combined p-value by ~1357x, while the entire achievable
+# weighting gain was bounded at 0.18% (WEIGHTS.md).
 
 
 def stouffer_combine(
@@ -287,9 +359,29 @@ def stouffer_combine(
         Zeros are KEPT and clamped to ``eps``: a categorically-rejected epoch is
         the strongest evidence available, not missing data.
     weights : array-like or None
-        Per-epoch weights.  ``None`` (default) means equal weights.  Any fixed
-        positive weights leave the null distribution of Z exactly standard
-        normal, so this cannot affect calibration — only power.
+        Per-epoch weights.  ``None`` (default) means equal weights, and that
+        default is now a MEASURED result rather than a placeholder — see
+        ``trove_tests/docs/WEIGHTS.md``.  Seven schemes were tested on held-out
+        kilonovae plus three contaminant classes; none beat equal weighting
+        beyond noise, and neither did the oracle weight ``w ~ mu_i`` that is
+        provably optimal by Cauchy-Schwarz.  The ceiling on any weighting gain
+        is ``sqrt(1 + CV^2)`` with CV the spread of per-epoch informativeness,
+        measured at 0.060 -> a 0.18% gain, two orders of magnitude below the
+        AUC noise floor.  Epoch informativeness is set by the grid's own
+        population spread ``tau`` (0.21-0.56 mag), which dominates ``sigma_obs``
+        and varies little across epochs.
+
+        Weights must be ANCILLARY: fixed with respect to z, i.e. functions of
+        the observing conditions only.  Any fixed positive weights leave the
+        null distribution of Z exactly standard normal, so they cannot affect
+        calibration — only power.  Weights that peek at the p-value being
+        weighted are NOT fixed and do break it: on 40000 synthetic draws,
+        ``w = 1/(p+0.01)`` gives KS 0.4316 against 0.0045 for equal weights,
+        while a fixed but extreme ``w = (1,1,1,1,1,1000)`` gives 0.0032.  In the
+        real pipeline ``w ~ 1/p_tail_std`` halves the median score of genuine
+        kilonovae (0.517 -> 0.313) and more than doubles KS (0.097 -> 0.234).
+        Do not weight by ``p_tail_std`` or anything else derived from
+        ``p_tail_mean``.
     eps : float
         Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
     rho : float
@@ -373,19 +465,60 @@ def brown_combine(
     ``f`` is the EFFECTIVE NUMBER OF INDEPENDENT EPOCHS, which is the useful
     diagnostic this method produces for free.
 
-    WHEN TO PREFER THIS OVER STOUFFER.  Measured on correlated epochs with both
-    methods given the same rho, Brown is the better calibrated of the two —
-    KS 0.0210 vs 0.0259 at rho = 0.06, and 0.0617 vs 0.0695 at rho = 0.26.  If
-    calibration is the only criterion, use this.
+    WHEN TO PREFER THIS OVER STOUFFER: FOR POWER, NOT CALIBRATION.
+
+    This docstring previously claimed the opposite — that Brown is the better
+    calibrated of the two, citing KS 0.0210 vs 0.0259 at rho = 0.06 and
+    0.0617 vs 0.0695 at rho = 0.26.  That claim does not replicate and has been
+    withdrawn.  Re-run as a PAIRED comparison (both combiners fed the identical
+    p-value matrix) over 40 independent seeds at the N those KS values imply
+    (~1700), the difference is noise: mean KS(Stouffer) - KS(Brown) = +0.0004
+    at rho = 0.06 and +0.0002 at rho = 0.26, against a seed-to-seed spread of
+    0.0069 and 0.0041, with Brown ahead in only 45% and 57% of seeds.  The
+    quoted margins are 0.71 and 1.92 sd of that spread.  Given the TRUE rho on
+    Gaussian-coupled data, the two are statistically indistinguishable.
+
+    End to end on held-out kilonovae, with rho derived from the grid at the
+    candidate's own cadence and the SAME value given to both methods, Stouffer
+    is better calibrated in ALL 36 cells tested (3 cadences x 4 rho settings x
+    3 seeds).  Mean KS at 4 nights, rho_hat = 0.390::
+
+        rho passed      Stouffer     Brown     Stouffer advantage
+        rho = 0           0.1103    0.1481          0.0378
+        0.5 * rho_hat     0.0430    0.0641          0.0211
+        rho_hat           0.0639    0.0780          0.0140
+        1.5 * rho_hat     0.0932    0.1289          0.0357
+
+    Note the shape: the gap is NARROWEST at the correct rho and widens in both
+    directions.  Brown degrades faster when rho is wrong, which matters because
+    in production rho is estimated, never known.  Stouffer's correction is
+    linear in rho; Brown's is a cubic polynomial feeding a moment-matched
+    chi-square, and it is the more fragile of the two.
+
+    What Brown does win is POWER.  Pooled AUC over all three contaminant
+    classes at 4 nights: 0.9380 against Stouffer's 0.9290 at rho_hat (seed sd
+    ~0.005), and Brown leads at every rho setting.  That is the real trade —
+    roughly +0.009 AUC for roughly +0.014 KS — not the calibration win
+    previously claimed.  Prefer Brown when ranking matters more than the score
+    being a calibrated p-value.
+
+    CAVEAT ON rho ITSELF.  For BOTH methods, 0.5 * rho_hat calibrates better
+    than rho_hat at every cadence (Stouffer 0.0486/0.0491/0.0430 vs
+    0.0577/0.0626/0.0639 at 2/3/4 nights).  The grid-derived estimator appears
+    to overstate the effective inter-epoch correlation by roughly a factor of
+    two.  That is a defect in the rho ESTIMATOR, not in either combiner, and it
+    has not been diagnosed — do not read ``rho_hat`` as ground truth.
 
     THREE REASONS IT IS NOT THE DEFAULT.
 
     1. It needs ``rho``, and with ``rho = 0`` it reduces EXACTLY to Fisher —
        which is the worst option of all under real correlation (KS 0.1547 at
-       rho = 0.26, against 0.1141 for Stouffer with no correction at all).  So
-       running this without a correlation estimate is worse than not using it.
-       Most of Brown's published advantage is the correlation correction, not
-       Fisher's combination rule.
+       rho = 0.26, against 0.1141 for Stouffer with no correction at all).
+       Confirmed end to end: at rho = 0 Brown reaches KS 0.1481 against
+       Stouffer's 0.1103, its widest deficit of any setting tested.  So running
+       this without a correlation estimate is worse than not using it.  Most of
+       Brown's published advantage is the correlation correction, not Fisher's
+       combination rule.
     2. It is far more sensitive to a single very small p-value.  With one
        corrupted photometric point among six good epochs, the median score fell
        by 7.1x under Brown against 2.7x under correlated Stouffer.  That
@@ -444,7 +577,12 @@ def stouffer_stats(
         See :func:`stouffer_combine`.
     weight_col : str or None
         Column holding per-epoch weights.  ``None`` means equal weights, which
-        is the only choice justified so far; see the module notes above.
+        is what the power test selected: no ancillary scheme beat it beyond
+        noise and neither did the provably-optimal oracle weight.  See
+        ``trove_tests/docs/WEIGHTS.md`` and the ``weights`` note on
+        :func:`stouffer_combine`.  Any column named here must be ANCILLARY --
+        derived from observing conditions, never from ``p_tail_mean`` or
+        ``p_tail_std``.
 
     Returns
     -------

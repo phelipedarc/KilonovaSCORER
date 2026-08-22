@@ -1,4 +1,13 @@
-from .core import load_observations, kilonovascorer_v1,overlap_chain,preprocess_lsst_like,binned_stats_cumulative_ptail
+# ``kilonovascorer_v1`` is the ONLY name core.py still supplies that core2.py
+# does not.  Everything else it used to export here — load_observations,
+# preprocess_lsst_like, overlap_chain, binned_stats_cumulative_ptail — is also
+# defined in core2 and was already being shadowed by the star-import below.
+# Importing them from both modules made the package's behaviour depend on the
+# order of these two lines: with them reversed, binned_stats_cumulative_ptail
+# would silently revert from Stouffer combination to the legacy IVW mean.
+# core2 now declares an explicit __all__, and this import lists only what is
+# genuinely unique to core.
+from .core import kilonovascorer_v1
 from .core2 import *
 from .plotting import plot_final_all_metrics, plot_simulations_LCS
 
