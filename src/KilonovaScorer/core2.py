@@ -11,15 +11,19 @@ Implements:
     ``M_lim``
   - ABC sequential survival diagnostic (overlap_chain), skippable with
     ``abc_compute``
-  - Cumulative scoring by Stouffer or Brown p-value combination, or by the
-    original logit-space inverse-variance weighted mean, selected with
-    ``method`` (binned_stats_cumulative_ptail)
+  - Partition reuse in the band loop, in the time-bin split and in the ABC
+    diagnostic, selected with ``band_split``, ``array_bins`` and
+    ``abc_reuse_bin`` -- speed only, outputs identical
+  - Cumulative scoring by Stouffer p-value combination or by the original
+    logit-space inverse-variance weighted mean, selected with ``method``
+    (binned_stats_cumulative_ptail)
 
 Every change made to the scoring since the paper is SELECTABLE rather than
 substituted: the defaults are the new behaviour, and the previous behaviour is
 reproduced exactly by
 
-    kilonovascorer_v3(..., p_tail_method="montecarlo", M_lim=None)
+    kilonovascorer_v3(..., p_tail_method="montecarlo", M_lim=None,
+                      band_split=False, abc_reuse_bin=False, array_bins=False)
     binned_stats_cumulative_ptail(..., method="ivw")
 
 Scoring in FLUX rather than absolute magnitude is designed and measured in
@@ -85,7 +89,6 @@ __all__ = [
     "compute_abs_mag_samples",
     "ivw_stats_logit",
     "stouffer_combine",
-    "brown_combine",
     "stouffer_stats",
     "calculate_sequential_score_stouffer",
     "calculate_sequential_score_logit",
@@ -374,80 +377,6 @@ def predictive_tail_kde(
 
         P_near_KNe = Pr(M_rep in [M_obs - k*sigma_obs, M_obs + k*sigma_obs])
 
-    TWO ESTIMATORS, SELECTED BY ``p_tail_method``
-    ---------------------------------------------
-    Both target the same integrals.  Neither is removed; the default changed.
-
-    ``p_tail_method="closed_form"`` (default).  The noise-convolved PPD is a
-    finite Gaussian mixture with one component per simulation, so its CDF is the
-    mixture of the component CDFs and both integrals are EXACT sums::
-
-        F(M_obs)   = (1/N) sum_i Phi((M_obs - m_i) / sigma_obs)
-        P_near_KNe = (1/N) sum_i [ Phi((M_obs + k*sigma_obs - m_i) / sigma_obs)
-                                 - Phi((M_obs - k*sigma_obs - m_i) / sigma_obs) ]
-
-    No KDE is fitted, no samples are drawn, the result is deterministic, and
-    ``sigma_obs`` enters once.
-
-    ``p_tail_method="montecarlo"``.  The original implementation, unchanged::
-
-        X* ~ KDE(sim_values);  Y = X* + eps,  eps ~ N(0, sigma_obs^2)
-        F_hat = fraction of the n_sim draws Y with Y <= M_obs
-
-    with ``p_tail_mean`` / ``p_tail_std`` taken as the mean and standard
-    deviation of P_tail over ``n_obs`` realisations of M_obs drawn from
-    ``N(M_obs, sigma_obs^2)``.  Two consequences are worth knowing before
-    selecting it, since they are why it is no longer the default:
-
-    1. It applies ``sigma_obs`` TWICE.  The jitter loop perturbs M_obs by the
-       same sigma already convolved into the reference, so the comparison is
-       effectively against a population of width ``sqrt(2) * sigma_obs``.
-    2. It is stochastic.  Two calls on identical inputs return different
-       numbers unless ``random_state`` is set.
-
-    It is retained because published results were produced with it, because it
-    is the only way to reproduce them, and because it is the reference the
-    closed form is checked against.
-
-    ``p_tail_std`` MEANS DIFFERENT THINGS UNDER THE TWO
-    ---------------------------------------------------
-    Under ``closed_form`` it is the finite-grid standard error of F_hat -- the
-    only quantity here that is genuinely uncertain.  It falls with the EFFECTIVE
-    number of simulations, those surviving the ``M_lim`` detection cut, via the
-    ``sum(w)`` denominator of the ratio-estimator form.  A shallow epoch
-    therefore carries a larger error than a deep one at the same raw grid size.
-
-    Under ``montecarlo`` it is the spread of P_tail over jittered M_obs, which
-    is a function of where the observation sits on the PPD rather than of how
-    well the PPD is resolved, and does not fall as the grid grows.
-
-    Under the default Stouffer combiner ``p_tail_std`` is a REPORTED DIAGNOSTIC
-    ONLY and is not read by the scoring path -- see ``stouffer_combine`` in
-    utils.py.  It sets the weights solely on the legacy ``method='ivw'`` branch,
-    where it was measurably harmful.
-
-    M_lim CONDITIONING APPLIES TO BOTH
-    ----------------------------------
-    Supplying ``M_lim`` conditions the reference on being detectable, and is
-    independent of the estimator choice.  Under ``closed_form`` that is the
-    ratio ``sum_i phi_i / sum_i w_i`` with ``w_i = Phi((M_lim - m_i)/sigma_obs)``
-    the probability that simulation ``i`` would be detected; under
-    ``montecarlo`` it is the same estimator evaluated by keeping only those
-    draws Y with ``Y <= M_lim``.  ``M_lim=None`` leaves the reference
-    unconditioned under either.
-
-    The numerator is ``phi_i`` rather than ``Pr(event AND detected)`` because in
-    MAGNITUDE the event implies detection: a source brighter than a detected
-    ``M_obs`` is brighter than ``M_lim``, so the intersection is the event
-    itself.  That identity is specific to magnitude and does NOT survive a change
-    to flux, where "fainter than observed" includes the whole undetectable tail
-    -- see REPORT.md Part IX section 44 before porting this.
-
-    P_near_KNe is a *local*, per-observation score and is intentionally not
-    aggregated across bands or epochs (paper Section 2).  Only P_tail_KNe feeds
-    into the cumulative score.  It is computed on the UNCONDITIONED PPD under
-    both estimators.
-
     Parameters
     ----------
     sim_values : np.ndarray
@@ -550,26 +479,6 @@ def predictive_tail_kde(
         p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
         p_tail_mean = p_tail_KNe
 
-        # --- finite-grid standard error of F_hat ----------------------------
-        # Spelled in the ratio-estimator form  sqrt(sum (phi - F w)^2) / sum(w),
-        # which makes the EFFECTIVE-N scaling explicit.  The denominator is
-        # sum(w), the detection-weighted grid size, so a shallow epoch whose
-        # M_lim cut leaves few detectable simulations gets a correspondingly
-        # larger error.
-        #
-        # This is the SAME estimator as the previous spelling,
-        #     sd((phi - F w) / mean(w), ddof=1) / sqrt(n_grid),
-        # not a change of definition: the 1/mean(w) inside the residual and the
-        # 1/sqrt(n_grid) outside combine to exactly 1/sum(w), and the two agree
-        # to the Bessel factor sqrt(n/(n-1)) alone -- 1.7e-2 at n = 30, falling
-        # as 1/n.  It is rewritten because the old form divided by the RAW grid
-        # count and so read as though the selection cut had been ignored.  It
-        # had not been: measured on 210 real scoreable epoch-band rows,
-        # p_tail_std already tracked n_eff, with the per-epoch median rising
-        # 0.0248 -> 0.0309 -> 0.0396 -> 0.0400 as median n_eff fell 937 -> 610
-        # -> 251 -> 145, and all 210 values distinct.  Dividing by sqrt(n_eff)
-        # INSTEAD of sqrt(n_grid) would double-count the correction, inflating
-        # the error by sqrt(n_grid/n_eff) (1.7x at M_lim = -14.5).
         n_grid = m.size
         if n_grid > 1:
             if use_limit:
@@ -580,17 +489,9 @@ def predictive_tail_kde(
         else:
             se_F = 0.0
 
-        # Resolution floor.  When F_hat saturates at 0 or 1 every residual
-        # vanishes and the sample formula returns EXACTLY zero -- an assertion
-        # of infinite precision at the one point where the estimate is least
-        # trustworthy.  A reference of n_eff effective draws cannot resolve a
-        # probability finer than 1/n_eff, so that is the floor.  It binds only
-        # near saturation; elsewhere the sampling term is an order of magnitude
-        # larger.
         if n_eff > 0.0:
             se_F = max(se_F, 1.0 / float(n_eff))
 
-        # P_tail is a probability; its standard error cannot exceed the range.
         p_tail_std = float(min(2.0 * se_F, 1.0))
 
         # P_near_KNe - ROPE mass, likewise a difference of two mixture CDFs
@@ -601,29 +502,14 @@ def predictive_tail_kde(
         )
 
     else:  # p_tail_method == "montecarlo" - the original estimator, unchanged
-        # NumPy's global random state when unseeded, which is what the original
-        # used; a dedicated Generator when a seed is given.
         rng = np.random if random_state is None else np.random.default_rng(random_state)
 
-        # 1. Noise-convolved PPD:  Y = X* + eps
         if kde is None:
             kde = gaussian_kde(m)
         n_draw = int(n_sim)
         x_star = kde.resample(n_draw, seed=random_state)[0]
         y_dist = x_star + rng.normal(0.0, s, size=n_draw)
 
-        # 2. Detection conditioning, if requested.  The Monte Carlo counterpart
-        #    of the sum(w) denominator: keep only draws that would have been
-        #    detected, then take the tail fraction among those.
-        #
-        #    n_eff, however, is computed from the SAME Kish formula as the
-        #    closed form, not from the survivor count.  Effective sample size
-        #    is a property of the selection, not of how the integral is
-        #    evaluated, and the survivor count estimates sum(w) rather than
-        #    Kish's (sum w)^2 / sum w^2 -- a different quantity whenever the
-        #    weights are diffuse (1311 against 1519 on a 4000-simulation grid
-        #    at M_lim = -15.8).  Deriving it the same way both ways is what
-        #    makes a single min_n_eff threshold mean one thing.
         y_ref = y_dist
         n_eff = float(m.size)
         if use_limit:
@@ -639,25 +525,17 @@ def predictive_tail_kde(
                 n_eff = 0.0
                 use_limit = False
 
-        # 3. F_hat and the two-sided tail (paper eq. 2)
         F_hat = float(np.mean(y_ref <= M_obs))
         p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
-        # 4. P_near_KNe - ROPE mass on the unconditioned draws (paper eq. 4)
         p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * s))
 
-        # 5. Uncertainty by resampling M_obs itself.  This is the second
-        #    application of sigma_obs noted above; it is preserved because it is
-        #    what the original did.
         M_obs_samples = rng.normal(M_obs, s, size=int(n_obs))
         F_hat_samples = (y_ref <= M_obs_samples[:, np.newaxis]).mean(axis=1)
         p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
         p_tail_mean = float(np.mean(p_tail_samples))
         p_tail_std = float(np.std(p_tail_samples))
 
-    # --- scoreability, shared by both estimators ----------------------------
-    # Only gated when a limit was actually requested: without one the reference
-    # is the whole grid and there is nothing for min_n_eff to protect against.
     scoreable = True
     if limit_requested:
         scoreable = (not limit_degenerate) and n_eff >= float(min_n_eff)
@@ -669,21 +547,11 @@ def predictive_tail_kde(
     return {
         "F_hat": F_hat,
         "p_tail_KNe": p_tail_KNe,
-        # Under the closed form this is identical to p_tail_KNe; under Monte
-        # Carlo it is the jitter mean.  Kept as a separate key so the downstream
-        # schema is the same either way.  Only the legacy ivw_stats_logit path
-        # reads p_tail_std; the default Stouffer combiner reads p_tail_mean
-        # alone.
         "p_tail_mean": p_tail_mean,
         "p_tail_std": p_tail_std,
         "p_near_KNe": p_near_KNe,
-        # Effective size of the reference actually used.  Equals N when
-        # unconditioned; the Kish n_eff of the detection weights when a limit
-        # is supplied, under EITHER estimator.  Use this, not a raw row count,
-        # to gate scorability.
         "n_eff": n_eff,
         "scoreable": bool(scoreable),
-        # Which estimator produced the numbers above.
         "p_tail_method": p_tail_method,
     }
 
@@ -748,9 +616,33 @@ def compute_consistent_ids_anyhit(
     if sim_bin.empty:
         return 0 if count_only else []
 
+    return _anyhit_from_arrays(
+        sim_bin["absolute_magnitude"].to_numpy(),
+        sim_bin["sample_id"].to_numpy(),
+        M_obs, sigma_obs, overlap_k, count_only,
+    )
+
+
+def _anyhit_from_arrays(
+    mag: np.ndarray,
+    sid: np.ndarray,
+    M_obs: float,
+    sigma_obs: float,
+    overlap_k: float = 2.0,
+    count_only: bool = False,
+):
+    """The ROPE any-hit test itself, on two aligned arrays.
+
+    Shared by both partition paths so that the DataFrame form and the array-view
+    form cannot drift apart: whichever way the rows were selected, this is the
+    code that decides which simulations are consistent.
+    """
+    if mag.size == 0:
+        return 0 if count_only else []
+
     rope_half_width = overlap_k * sigma_obs
-    inside = np.abs(sim_bin["absolute_magnitude"].to_numpy() - M_obs) <= rope_half_width
-    ids = sim_bin["sample_id"].to_numpy()[inside]
+    inside = np.abs(mag - M_obs) <= rope_half_width
+    ids = sid[inside]
     ids = pd.unique(ids[pd.notna(ids)])
     return len(ids) if count_only else ids.tolist()
 
@@ -858,20 +750,14 @@ def binned_stats_cumulative_ptail(
     Aggregate per-observation P_tail_KNe scores into time-binned cumulative scores.
 
     Scores are combined within each time bin, then updated sequentially across
-    bins to produce a running cumulative score.  THREE COMBINERS ARE AVAILABLE
-    and none has been removed; the default changed from ``"ivw"`` to
-    ``"stouffer"``.
+    bins to produce a running cumulative score.  BOTH COMBINERS ARE AVAILABLE;
+    the default changed from ``"ivw"`` to ``"stouffer"``.
 
     ``method="stouffer"`` (default).  Each epoch's P_tail is treated as what it
     is under the null — a p-value, uniform on (0, 1) — and combined as a
     standardised SUM of normal scores, ``Z = sum(w z) / sqrt(sum(w^2))`` with
     ``z = Phi^-1(1 - p)``.  Z is exactly standard normal under the null for any
     fixed positive weights, so the combined score is a calibrated p-value.
-
-    ``method="brown"``.  Moment-matched scaled chi-square (correlation-corrected
-    Fisher).  Slightly better power, slightly worse calibration, and it needs
-    ``rho`` — with ``rho=0`` it degenerates exactly to Fisher, which is the worst
-    option under correlated epochs.  A warning is emitted in that case.
 
     ``method="ivw"``.  The ORIGINAL combiner: inverse-variance weighted mean in
     logit space, weights ``1/sigma_z^2`` from ``p_tail_std`` via the delta method
@@ -882,6 +768,12 @@ def binned_stats_cumulative_ptail(
     notes above ``stouffer_combine`` in utils.py for why it is no longer the
     default.
 
+    Brown's method (moment-matched scaled chi-square) was implemented and
+    measured head to head, then REMOVED because it is not being used.  It won on
+    power and lost on robustness -- ~7x more swayed by a single bad epoch -- and
+    with ``rho=0`` it degenerates exactly to Fisher.  The full comparison is
+    kept in REPORT.md section 16.6.
+
     Parameters
     ----------
     metric_df : pd.DataFrame
@@ -890,18 +782,18 @@ def binned_stats_cumulative_ptail(
     bin_size : float
         Width of time bins in days.  Should match the scorer's
         ``time_bin_width`` (default 0.2 d).
-    method : {"stouffer", "brown", "ivw"}
+    method : {"stouffer", "ivw"}
         Combiner, as above.
     weight_col : str or None
-        Column of per-epoch weights for the p-value combiners.  ``None``
+        Column of per-epoch weights for the Stouffer combiner.  ``None``
         (default) means equal weights, which is what the power test selected.
         Any column named here must be ANCILLARY — a function of the observing
         conditions only, never of ``p_tail_mean`` or ``p_tail_std``.  Ignored by
         ``method="ivw"``, which sets its own weights.
     rho : float
-        Mean inter-epoch correlation of the normal scores, used by the p-value
-        combiners to avoid treating correlated epochs as independent.  ``0.0``
-        (default) assumes independence.  Ignored by ``method="ivw"``.
+        Mean inter-epoch correlation of the normal scores, used by Stouffer to
+        avoid treating correlated epochs as independent.  ``0.0`` (default)
+        assumes independence.  Ignored by ``method="ivw"``.
 
     Returns
     -------
@@ -912,13 +804,8 @@ def binned_stats_cumulative_ptail(
     """
   #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
   #modidy back to +  bin_size
-    if method not in ("stouffer", "brown", "ivw"):
-        raise ValueError("method must be 'stouffer', 'brown' or 'ivw'.")
-    if method == "brown" and not rho:
-        logger.warning(
-            "method='brown' with rho=0 reduces exactly to Fisher, which is the "
-            "worst-calibrated option under correlated epochs. Supply rho."
-        )
+    if method not in ("stouffer", "ivw"):
+        raise ValueError("method must be 'stouffer' or 'ivw'.")
 
     bin_edges = np.arange(
         metric_df["obs_time"].min() - bin_size / 2,
@@ -950,11 +837,10 @@ def binned_stats_cumulative_ptail(
     # p-value combination.  Per-bin first, then a cumulative combination that
     # goes back to the raw per-epoch p-values rather than re-combining bin
     # scores.
-    combiner = brown_combine if method == "brown" else stouffer_combine  # noqa: F821
     binned_stats = (
         metric_df.groupby("time_bin", observed=True)
         .apply(lambda g: stouffer_stats(  # noqa: F821 (from utils.*)
-            g, weight_col=weight_col, rho=rho, combiner=combiner))
+            g, weight_col=weight_col, rho=rho))
         .reset_index()
     )
     binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
@@ -980,16 +866,12 @@ def binned_stats_cumulative_ptail(
         w_by_bin = None
 
     running_mean, running_err = calculate_sequential_score_stouffer(  # noqa: F821
-        p_by_bin, weights_by_bin=w_by_bin, rho=rho, combiner=combiner,
+        p_by_bin, weights_by_bin=w_by_bin, rho=rho,
     )
     binned_stats["running_mean"] = running_mean
     binned_stats["running_std"] = running_err
 
     return binned_stats
-
-
-
-
 
 # ---------------------------------------------------------------------------
 # The distance systematic: estimating rho, and marginalising it properly
@@ -1271,6 +1153,11 @@ def combined_score_marginalised(
 # Main scorer
 # ---------------------------------------------------------------------------
 
+#: Returned for a bin that holds no simulations, so that the per-observation
+#: branch always yields arrays and never None.
+_EMPTY_F = np.empty(0, dtype=float)
+
+
 def kilonovascorer_v3(
     data_obs: pd.DataFrame,
     data_sim: pd.DataFrame,
@@ -1290,6 +1177,9 @@ def kilonovascorer_v3(
     abc_compute: bool = True,
     abc_return_ids: bool = True,
     sigma_col: Optional[str] = None,
+    band_split: bool = True,
+    abc_reuse_bin: bool = True,
+    array_bins: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -1413,6 +1303,64 @@ def kilonovascorer_v3(
         be calibrated against a null that puts the systematic back.  See
         REPORT.md Part X.
 
+    band_split : bool
+        Partition ``data_sim`` and ``data_obs`` by filter ONCE with a groupby
+        (``True``, default) instead of re-scanning the full table per band with
+        ``data_sim["filter_mapped"] == band``.  On an object-dtype string column
+        that comparison is an elementwise Python-string test over every row, run
+        once per band, and it was the single largest line in the profile --
+        larger than the ABC diagnostic and an order of magnitude larger than
+        ``predictive_tail_kde``.  Measured 2.0x at a 10,000-sample grid and 1.9x
+        at 25,000.
+
+        ``False`` restores the original per-band comparison.  The two select the
+        same rows in the same order, so this is a speed switch only; it exists to
+        make that claim checkable rather than asserted.
+
+    abc_reuse_bin : bool
+        Hand the already-selected time-bin slice to the ABC diagnostic
+        (``True``, default) instead of letting it re-select the slice for itself.
+        ``kilonovascorer_v3`` groups the band by ``time_bin`` up front and holds
+        the current bin in order to score against it;
+        ``compute_consistent_ids_anyhit`` was then rebuilding exactly those rows
+        with a boolean mask over the WHOLE band, once per observation -- 200,000
+        rows scanned to reach 10,000 of them at a 10,000-sample grid.  The waste
+        is a factor of the number of time bins.  Measured 3.3x on the diagnostic
+        at 25,000 samples.
+
+        ``False`` restores the re-selection, which is the code the diagnostic
+        still runs whenever it is called directly without ``sim_bin=``.  The ROPE
+        test, the any-hit rule and the returned ids are untouched either way, so
+        the two agree exactly.
+
+    array_bins : bool
+        Partition each band's grid into per-bin ARRAY VIEWS (``True``, default)
+        rather than into a DataFrame per bin.  ``sim_band.groupby("time_bin")``
+        materialises one small DataFrame per bin -- 80 of them for four bands and
+        twenty bins -- and every use site then immediately calls ``.to_numpy()``
+        on two of their columns.  A stable argsort on the bin codes plus
+        ``np.diff`` gives the same partition as slice boundaries, and a slice of
+        a numpy array is a view: no take, no copy, no DataFrame.  After the other
+        two optimisations this was 72% of the run and the top three entries in
+        the profile; measured 2.3x on the partition.
+
+        ``False`` restores the groupby.  Equivalence rests on ``groupby``
+        preserving within-group row order and ``np.argsort(kind="stable")`` doing
+        the same, so group k and slice k hold the same rows in the same ORDER --
+        which is what makes the ABC id lists match element for element and not
+        merely as sets.
+
+        The ROPE test is shared: both paths call ``_anyhit_from_arrays`` on the
+        same two arrays, so they cannot drift apart.  With
+        ``abc_reuse_bin=False`` the diagnostic re-selects from ``sim_band``
+        exactly as before, under either partition.
+
+    All three flags are speed switches with no effect on any output.  Turning
+    them off reproduces the pre-optimisation scorer::
+
+        kilonovascorer_v3(..., band_split=False, abc_reuse_bin=False,
+                          array_bins=False)
+
     Returns
     -------
     results_df : pd.DataFrame
@@ -1427,24 +1375,50 @@ def kilonovascorer_v3(
     results: List[Dict[str, Any]] = []
     overlap_summary_by_band: Dict[str, Any] = {}
 
-    # Split by band ONCE.  The previous form re-scanned the full simulation table
-    # per band with `data_sim["filter_mapped"] == band`, which on a string column
-    # is an elementwise comparison over every row -- 800,000 rows x 4 bands, and
-    # the single largest cost in the profile, larger than the ABC diagnostic and
-    # an order of magnitude larger than predictive_tail_kde.  groupby partitions
-    # in one pass: measured 2.0x at a 10,000-sample grid, 1.9x at 25,000.
-    sim_by_band = {k: v for k, v in data_sim.groupby("filter_mapped", observed=True)}
-    obs_by_band = {k: v for k, v in data_obs.groupby("filter_mapped", observed=True)}
+    # Split by band ONCE, unless the caller asked for the original behaviour.
+    # The previous form re-scanned the full simulation table per band with
+    # `data_sim["filter_mapped"] == band`, which on a string column is an
+    # elementwise comparison over every row -- 800,000 rows x 4 bands, and the
+    # single largest cost in the profile, larger than the ABC diagnostic and an
+    # order of magnitude larger than predictive_tail_kde.  groupby partitions in
+    # one pass: measured 2.0x at a 10,000-sample grid, 1.9x at 25,000.
+    #
+    # The two select the same rows in the same order -- groupby preserves
+    # within-group order, and a NaN key is dropped by both (dropna=True there,
+    # `NaN == band` being False here) -- so this is a speed switch and nothing
+    # more.
+    sim_by_band: Optional[Dict[Any, pd.DataFrame]] = None
+    obs_by_band: Optional[Dict[Any, pd.DataFrame]] = None
+    if band_split:
+        sim_by_band = {k: v for k, v in data_sim.groupby("filter_mapped", observed=True)}
+        obs_by_band = {k: v for k, v in data_obs.groupby("filter_mapped", observed=True)}
 
     for band in band_list:
         # 1. Filter data for this band
-        sim_band = sim_by_band.get(band)
-        obs_band = obs_by_band.get(band)
+        if band_split:
+            sim_band = sim_by_band.get(band)
+            obs_band = obs_by_band.get(band)
+            if sim_band is None or obs_band is None:
+                logger.debug("No data for band %s — skipping.", band)
+                continue
+        else:
+            # The original: one elementwise comparison over the whole table.
+            sim_band = data_sim[data_sim["filter_mapped"] == band]
+            obs_band = data_obs[data_obs["filter_mapped"] == band]
 
-        if sim_band is None or obs_band is None or sim_band.empty or obs_band.empty:
+        if sim_band.empty or obs_band.empty:
             logger.debug("No data for band %s — skipping.", band)
             continue
-        sim_band = sim_band.copy()
+
+        # sim_band is copied only when a `time_bin` COLUMN has to be written to
+        # it, which is exactly when the legacy ABC path might re-select on that
+        # column.  Under array_bins with abc_reuse_bin the bin codes live in a
+        # standalone array and the frame is only ever read, so the copy --
+        # 500,000 rows x 4 columns per band at a 25,000-sample grid -- buys
+        # nothing.
+        _needs_bin_col = not (array_bins and abc_reuse_bin)
+        if _needs_bin_col:
+            sim_band = sim_band.copy()
         obs_band = obs_band.copy()
 
         # 2. Assign simulation time bins (computed once per band).
@@ -1463,12 +1437,32 @@ def kilonovascorer_v3(
         # assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
         # assert bins[-2] < t_last < bins[-1], "Last observation not centred in last bin."
 
-        sim_band["time_bin"] = np.digitize(sim_band["time"], bins)
+        _bin_codes = np.digitize(sim_band["time"].to_numpy(), bins)
+        if _needs_bin_col:
+            sim_band["time_bin"] = _bin_codes
 
-        # Pre-group simulations by time bin for O(1) lookup per observation
-        sim_groups: Dict[int, pd.DataFrame] = {
-            k: v for k, v in sim_band.groupby("time_bin")
-        }
+        # Pre-partition simulations by time bin for O(1) lookup per observation.
+        sim_groups: Optional[Dict[int, pd.DataFrame]] = None
+        sim_arrays: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None
+        if array_bins:
+            # A stable sort on the bin codes puts each bin's rows in one
+            # contiguous run, IN THEIR ORIGINAL ORDER, so the runs are exactly
+            # groupby's groups.  np.diff finds the run boundaries; the slices
+            # are views, not copies.
+            _tb = _bin_codes
+            _order = np.argsort(_tb, kind="stable")
+            _tb_sorted = _tb[_order]
+            _mag = sim_band["absolute_magnitude"].to_numpy()[_order]
+            _sid = sim_band["sample_id"].to_numpy()[_order]
+            _cuts = np.flatnonzero(np.diff(_tb_sorted)) + 1
+            _starts = np.concatenate(([0], _cuts))
+            _stops = np.concatenate((_cuts, [_tb_sorted.size]))
+            sim_arrays = {
+                int(_tb_sorted[a]): (_mag[a:b], _sid[a:b])
+                for a, b in zip(_starts, _stops)
+            }
+        else:
+            sim_groups = {k: v for k, v in sim_band.groupby("time_bin")}
 
         # Per-band tracking for ABC overlap chain
         band_times: List[float] = []
@@ -1511,12 +1505,23 @@ def kilonovascorer_v3(
                 continue
 
             bin_idx = int(np.digitize(t_obs, bins))
-            sim_bin = sim_groups.get(bin_idx, pd.DataFrame())
+            # One branch, yielding the same three things either way: how many
+            # simulations the bin holds, their magnitudes, and their ids.
+            if array_bins:
+                mag_bin, sid_bin = sim_arrays.get(bin_idx, (_EMPTY_F, _EMPTY_F))
+                sim_bin = None
+                n_bin = int(mag_bin.size)
+            else:
+                sim_bin = sim_groups.get(bin_idx, pd.DataFrame())
+                n_bin = len(sim_bin)
+                mag_bin = (sim_bin["absolute_magnitude"].to_numpy()
+                           if n_bin else _EMPTY_F)
+                sid_bin = sim_bin["sample_id"].to_numpy() if n_bin else _EMPTY_F
 
-            if len(sim_bin) < min_sim_points:
+            if n_bin < min_sim_points:
                 logger.debug(
                     "Bin %d has %d simulations (< %d) — skipping.",
-                    bin_idx, len(sim_bin), min_sim_points,
+                    bin_idx, n_bin, min_sim_points,
                 )
                 continue
 
@@ -1527,13 +1532,11 @@ def kilonovascorer_v3(
             cached_kde = None
             if p_tail_method == "montecarlo":
                 if bin_idx not in kde_cache:
-                    kde_cache[bin_idx] = gaussian_kde(
-                        sim_bin["absolute_magnitude"].to_numpy()
-                    )
+                    kde_cache[bin_idx] = gaussian_kde(mag_bin)
                 cached_kde = kde_cache[bin_idx]
 
             metric = predictive_tail_kde(
-                sim_bin["absolute_magnitude"].to_numpy(),
+                mag_bin,
                 M_obs=M_obs,
                 sigma_obs=sigma_obs,
                 k=k_near,
@@ -1547,22 +1550,34 @@ def kilonovascorer_v3(
             )
 
             # 3b. ABC diagnostic — consistent simulation IDs at this epoch.
-            #     `sim_bin` is passed through: it is exactly the rows
-            #     compute_consistent_ids_anyhit would otherwise select for itself,
-            #     and the scorer already holds it.  Without it the function
-            #     rescans the whole band once per observation -- 200,000 rows to
-            #     reach 10,000 of them -- which measured 1.6x (10,000 samples) to
-            #     1.8x (25,000 samples) of the entire diagnostic's cost.
+            #     `sim_bin` is passed through when abc_reuse_bin: it is exactly
+            #     the rows compute_consistent_ids_anyhit would otherwise select
+            #     for itself, and the scorer already holds it.  Without it the
+            #     function rescans the whole band once per observation -- 200,000
+            #     rows to reach 10,000 of them at a 10,000-sample grid, a waste
+            #     of a factor of the number of time bins -- which measured 3.3x
+            #     of the diagnostic's cost at 25,000 samples.
+            #
+            #     Passing None is not a re-implementation of the old path: it IS
+            #     the old path, still the default inside the diagnostic and still
+            #     what runs for any caller invoking it directly.
             consistent_ids: List = []
             if abc_compute:
-                consistent_ids = compute_consistent_ids_anyhit(
-                    sim_band=sim_band,
-                    bin_idx=bin_idx,
-                    M_obs=M_obs,
-                    sigma_obs=sigma_obs,
-                    overlap_k=overlap_k,
-                    sim_bin=sim_bin,
-                )
+                if abc_reuse_bin and array_bins:
+                    # The rows are already in hand as two arrays; go straight to
+                    # the shared ROPE test.
+                    consistent_ids = _anyhit_from_arrays(
+                        mag_bin, sid_bin, M_obs, sigma_obs, overlap_k,
+                    )
+                else:
+                    consistent_ids = compute_consistent_ids_anyhit(
+                        sim_band=sim_band,
+                        bin_idx=bin_idx,
+                        M_obs=M_obs,
+                        sigma_obs=sigma_obs,
+                        overlap_k=overlap_k,
+                        sim_bin=sim_bin if abc_reuse_bin else None,
+                    )
 
             # 3c. Safe time-bin edge lookup
             bin_low = float(bins[bin_idx - 1] if bin_idx > 0 else bins[0])
@@ -1584,7 +1599,7 @@ def kilonovascorer_v3(
                 "n_eff": metric["n_eff"],
                 "scoreable": metric["scoreable"],
                 "p_tail_method": metric["p_tail_method"],
-                "n_sim_bin": len(sim_bin),
+                "n_sim_bin": n_bin,
                 "n_consistent_lcs": len(consistent_ids),
                 "consistent_ids": consistent_ids if abc_return_ids else [],
                 # ABC overlap fields — populated in post-processing step 4

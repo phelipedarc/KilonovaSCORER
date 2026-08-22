@@ -19,7 +19,6 @@ import pandas as pd
 from typing import List, Optional
 
 from scipy.special import expit, logit, ndtr, ndtri
-from scipy.stats import chi2
 
 logger = logging.getLogger(__name__)
 
@@ -77,33 +76,6 @@ def compute_abs_mag_samples(
         Returned only when ``return_components``.  The distance-modulus
         uncertainty: ONE number for the whole candidate, identical at every
         epoch.
-
-    Notes
-    -----
-    When called with arrays, one independent set of ``n_samples`` distance
-    draws is shared across all rows (same distance realisation), while
-    apparent-magnitude noise is drawn independently per row.  This correctly
-    reflects that the distance uncertainty is a global systematic.
-
-    WHY THE SPLIT MATTERS, AND WHAT IT IS NOT
-    -----------------------------------------
-    ``abs_mag_std`` is the correct MARGINAL uncertainty on one observation:
-    ``Var = sigma_phot^2 + sigma_mu^2``, and a ``P_tail`` computed with it is a
-    correctly calibrated per-epoch p-value.  Nothing about the per-epoch number
-    is wrong, and this function's contract is unchanged.
-
-    What it cannot express is that ``sigma_mu`` is the SAME DRAW at every epoch.
-    Downstream, ``predictive_tail_kde`` consumes ``abs_mag_std`` as independent
-    per-epoch noise, so a shared systematic is counted once per epoch and the
-    correlation it induces is invisible to the combiner.  On AT2017gfo
-    (38.589 +/- 6.997 Mpc) that is 0.394 mag of distance against 0.060 mag of
-    photometry -- **97.7% of the variance, and 100% of it shared** -- which
-    leaves the per-epoch p-values calibrated but the COMBINED score miscalibrated
-    by 4-6x (REPORT.md Part X).
-
-    Returning the components lets a caller do better: score with ``sigma_phot``
-    and handle ``sigma_mu`` once per candidate.  See ``estimate_rho`` and
-    ``simulate_null_zsum`` in core2.py.
     """
     scalar_input = np.ndim(app_mag) == 0
 
@@ -250,99 +222,6 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
 
     return pd.Series({"mean": mean, "std": std, "count": len(p)})
 
-
-# ---------------------------------------------------------------------------
-# Stouffer combination of per-epoch p-values
-# ---------------------------------------------------------------------------
-#
-# WHY NOT INVERSE-VARIANCE WEIGHTING
-# ----------------------------------
-# IVW assumes several noisy measurements of ONE SHARED QUANTITY, each with a
-# known variance; then sum(w_i z_i)/sum(w_i) with w_i = 1/sigma_i^2 is the
-# minimum-variance unbiased combination.  That is not the situation here.
-#
-# Under the null each P_tail_i is a P-VALUE, uniform on (0, 1) — this is the
-# probability integral transform, measured holding at KS 0.018.  Six uniforms
-# are not six noisy estimates of a common mean.  There is no shared parameter to
-# average toward, so IVW's optimality theorem simply does not apply, and the
-# framework has no slot for a per-observation uncertainty.  That is why every
-# candidate definition of ``p_tail_std`` felt arbitrary: they are three answers
-# to a question that should not be asked.  Under the null, a badly-measured
-# epoch's p-value is not "noisier" — it is exactly as uniform as a well-measured
-# one.
-#
-# It is not merely unmotivated, it is harmful.  Measured on held-out kilonovae,
-# where the null is true by construction and a correct combiner must return a
-# uniform score:
-#
-#     per-epoch P_tail (the input)         KS 0.018
-#     IVW logit, p_tail_std weights        KS 0.204   <- production
-#     Fisher (assumes independence)        KS 0.159
-#     IVW logit, EQUAL weights             KS 0.137
-#     Stouffer Z                           KS 0.115
-#     Brown (correlation-corrected Fisher) KS 0.050
-#
-# The combiner was an order of magnitude worse than its own input, and deleting
-# the weights entirely improved it.  Two further defects compound this: the delta
-# method sigma_z = sigma_p/(p(1-p)) is a first-order linearisation requiring
-# sigma_p << p(1-p), which fails outright at small P_tail (at P_tail = 0.0055 the
-# measured sigma_p = 0.0094 EXCEEDS the probability); and with sigma_obs
-# identical at every row the weight still varied 67x with where the observation
-# sat relative to the population — backwards, so that the point most strongly
-# rejecting the hypothesis got weight 0.34 while a mildly informative one got
-# 22.9.
-#
-# WHAT STOUFFER CHANGES
-# ---------------------
-# Two changes, one cosmetic and one that is the whole point.
-#
-#   now       z_i = logit(p_i)          Z = sum(w_i z_i) / sum(w_i)      AVERAGE
-#   proposed  z_i = Phi^-1(1 - p_i)     Z = sum(w_i z_i) / sqrt(sum(w_i^2))  SUM
-#
-# The link function logit -> Phi^-1 is cosmetic; the two agree to a scale factor
-# (logit(p) ~ 1.70 * Phi^-1(p)) across the range that matters.  It is swapped
-# because Phi^-1 is the inverse of the NORMAL CDF, which is what makes the
-# normaliser exact.
-#
-# The normaliser sum(w) -> sqrt(sum(w^2)) is the real change.  Dividing by
-# sum(w) produces a weighted average — a number with no known null distribution.
-# Dividing by sqrt(sum(w^2)) produces a STANDARDISED TEST STATISTIC.  Under the
-# null each p_i is uniform, so z_i = Phi^-1(1 - p_i) is exactly N(0, 1).  A
-# weighted sum of independent normals is normal with mean sum(w_i)*0 = 0 and
-# variance sum(w_i^2)*1, so
-#
-#     Z ~ N(0, 1)   EXACTLY, for ANY fixed positive weights.
-#
-# The weights appear in the numerator and the normaliser and cancel.  Under IVW
-# the weights WERE the calibration, and getting them wrong miscalibrated the
-# output — which is exactly what was measured.  Under Stouffer the weights
-# cannot break calibration; they affect only POWER, i.e. how well real kilonovae
-# separate from contaminants.  That converts an unanswerable question ("what is
-# the uncertainty on a p-value?") into a measurable one ("which weights best
-# separate kilonovae from supernovae?").
-#
-# WHY NOT BROWN
-# -------------
-# An earlier version of this note was headed "WHY NOT BROWN, WHICH MEASURED
-# BEST", on the strength of Brown reaching KS 0.050 against Stouffer's 0.115 in
-# an early single-seed test where only Brown was given a correlation estimate.
-# That comparison was not like-for-like and its conclusion has been withdrawn.
-# Given the SAME grid-derived rho, Stouffer is better calibrated in all 36
-# end-to-end cells tested (3 cadences x 4 rho settings x 3 seeds); at 4 nights
-# and rho_hat = 0.390 the means are 0.0639 for Stouffer against 0.0780 for
-# Brown.  Brown wins on POWER instead (pooled AUC 0.9380 vs 0.9290), and
-# degrades faster when rho is misspecified.  See ``brown_combine`` for the full
-# table and ``trove_tests/docs/WEIGHTS.md`` for the harness.
-#
-# Brown remains non-default because it needs ``rho`` and collapses to plain
-# Fisher without one, because it is far more sensitive to a single corrupted
-# p-value, and because it has no slot for weights.  ``rho`` below is the opt-in
-# hook for the correlation correction on either method — and note that
-# supplying it matters far more than any weighting choice: at rho = 0.39 the
-# correction moves the combined p-value by ~1357x, while the entire achievable
-# weighting gain was bounded at 0.18% (WEIGHTS.md).
-
-
 def stouffer_combine(
     p,
     weights=None,
@@ -441,127 +320,11 @@ def stouffer_combine(
     }
 
 
-def brown_combine(
-    p,
-    weights=None,
-    eps: float = 1e-4,
-    rho: float = 0.0,
-):
-    """
-    Combine p-values by Brown's method — Fisher, moment-matched for correlation.
-
-    Fisher's statistic ``X2 = -2 sum ln(p_i)`` is chi2(2k) under independence.
-    Brown (1975) rescales it for correlated p-values by matching the first two
-    moments of a scaled chi-square::
-
-        X2 / c ~ chi2(f),   c = Var(X2) / (2 E[X2]),   f = 2 E[X2]^2 / Var(X2)
-
-    with ``E[X2] = 2k`` and ``Var(X2) = 4k + sum_{i!=j} cov(-2 ln p_i, -2 ln p_j)``.
-    The covariance uses the Kost & McDermott (2002) polynomial in the underlying
-    correlation, which refines Brown's original fit::
-
-        cov ~ 3.263 rho + 0.710 rho^2 + 0.027 rho^3
-
-    ``f`` is the EFFECTIVE NUMBER OF INDEPENDENT EPOCHS, which is the useful
-    diagnostic this method produces for free.
-
-    WHEN TO PREFER THIS OVER STOUFFER: FOR POWER, NOT CALIBRATION.
-
-    This docstring previously claimed the opposite — that Brown is the better
-    calibrated of the two, citing KS 0.0210 vs 0.0259 at rho = 0.06 and
-    0.0617 vs 0.0695 at rho = 0.26.  That claim does not replicate and has been
-    withdrawn.  Re-run as a PAIRED comparison (both combiners fed the identical
-    p-value matrix) over 40 independent seeds at the N those KS values imply
-    (~1700), the difference is noise: mean KS(Stouffer) - KS(Brown) = +0.0004
-    at rho = 0.06 and +0.0002 at rho = 0.26, against a seed-to-seed spread of
-    0.0069 and 0.0041, with Brown ahead in only 45% and 57% of seeds.  The
-    quoted margins are 0.71 and 1.92 sd of that spread.  Given the TRUE rho on
-    Gaussian-coupled data, the two are statistically indistinguishable.
-
-    End to end on held-out kilonovae, with rho derived from the grid at the
-    candidate's own cadence and the SAME value given to both methods, Stouffer
-    is better calibrated in ALL 36 cells tested (3 cadences x 4 rho settings x
-    3 seeds).  Mean KS at 4 nights, rho_hat = 0.390::
-
-        rho passed      Stouffer     Brown     Stouffer advantage
-        rho = 0           0.1103    0.1481          0.0378
-        0.5 * rho_hat     0.0430    0.0641          0.0211
-        rho_hat           0.0639    0.0780          0.0140
-        1.5 * rho_hat     0.0932    0.1289          0.0357
-
-    Note the shape: the gap is NARROWEST at the correct rho and widens in both
-    directions.  Brown degrades faster when rho is wrong, which matters because
-    in production rho is estimated, never known.  Stouffer's correction is
-    linear in rho; Brown's is a cubic polynomial feeding a moment-matched
-    chi-square, and it is the more fragile of the two.
-
-    What Brown does win is POWER.  Pooled AUC over all three contaminant
-    classes at 4 nights: 0.9380 against Stouffer's 0.9290 at rho_hat (seed sd
-    ~0.005), and Brown leads at every rho setting.  That is the real trade —
-    roughly +0.009 AUC for roughly +0.014 KS — not the calibration win
-    previously claimed.  Prefer Brown when ranking matters more than the score
-    being a calibrated p-value.
-
-    CAVEAT ON rho ITSELF.  For BOTH methods, 0.5 * rho_hat calibrates better
-    than rho_hat at every cadence (Stouffer 0.0486/0.0491/0.0430 vs
-    0.0577/0.0626/0.0639 at 2/3/4 nights).  The grid-derived estimator appears
-    to overstate the effective inter-epoch correlation by roughly a factor of
-    two.  That is a defect in the rho ESTIMATOR, not in either combiner, and it
-    has not been diagnosed — do not read ``rho_hat`` as ground truth.
-
-    THREE REASONS IT IS NOT THE DEFAULT.
-
-    1. It needs ``rho``, and with ``rho = 0`` it reduces EXACTLY to Fisher —
-       which is the worst option of all under real correlation (KS 0.1547 at
-       rho = 0.26, against 0.1141 for Stouffer with no correction at all).
-       Confirmed end to end: at rho = 0 Brown reaches KS 0.1481 against
-       Stouffer's 0.1103, its widest deficit of any setting tested.  So running
-       this without a correlation estimate is worse than not using it.  Most of
-       Brown's published advantage is the correlation correction, not Fisher's
-       combination rule.
-    2. It is far more sensitive to a single very small p-value.  With one
-       corrupted photometric point among six good epochs, the median score fell
-       by 7.1x under Brown against 2.7x under correlated Stouffer.  That
-       sensitivity is a virtue against a genuine outlier epoch and a liability
-       against a bad subtraction, which a real-time stream produces routinely.
-    3. There is no natural slot for weights.  Stouffer takes arbitrary positive
-       weights with its null distribution exactly preserved, which is where the
-       per-epoch informativeness implied by ``M_lim`` has to go.  ``weights`` is
-       accepted here and IGNORED, for signature compatibility only.
-
-    Returns
-    -------
-    dict with keys ``p_combined``, ``X2``, ``f`` (effective dof), ``count``.
-    """
-    p = np.asarray(p, dtype=float)
-    p = p[np.isfinite(p)]
-    if p.size == 0:
-        return {"p_combined": np.nan, "X2": np.nan, "f": np.nan, "count": 0}
-
-    k = int(p.size)
-    X2 = float(-2.0 * np.log(np.clip(p, eps, 1.0)).sum())
-    E = 2.0 * k
-    r = float(rho)
-    cov = 3.263 * r + 0.710 * r ** 2 + 0.027 * r ** 3
-    Var = 4.0 * k + k * (k - 1) * cov
-    if not np.isfinite(Var) or Var <= 0:
-        Var = 4.0 * k                       # fall back to independence
-    c = Var / (2.0 * E)
-    f = 2.0 * E ** 2 / Var
-    return {
-        "p_combined": float(chi2.sf(X2 / c, f)),
-        "X2": X2,
-        "f": float(f),
-        "count": k,
-    }
-
-
 def stouffer_stats(
     group: pd.DataFrame,
     eps: float = 1e-4,
     weight_col: Optional[str] = None,
     rho: float = 0.0,
-    combiner=None,
 ) -> pd.Series:
     """
     Per-time-bin Stouffer combination, shaped as a drop-in for
@@ -601,8 +364,7 @@ def stouffer_stats(
     w = (group[weight_col].to_numpy(dtype=float)
          if weight_col is not None and weight_col in group else None)
 
-    combine = stouffer_combine if combiner is None else combiner
-    res = combine(p, weights=w, eps=eps, rho=rho)
+    res = stouffer_combine(p, weights=w, eps=eps, rho=rho)
     if res["count"] == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
@@ -621,7 +383,6 @@ def calculate_sequential_score_stouffer(
     weights_by_bin=None,
     eps: float = 1e-4,
     rho: float = 0.0,
-    combiner=None,
 ):
     """
     Cumulative score after each time bin, by Stouffer combination.
@@ -655,7 +416,6 @@ def calculate_sequential_score_stouffer(
     running_score = np.full(n, np.nan)
     running_err = np.full(n, np.nan)
 
-    combine = stouffer_combine if combiner is None else combiner
     acc_p: List[float] = []
     acc_w: List[float] = []
     for i in range(n):
@@ -665,7 +425,7 @@ def calculate_sequential_score_stouffer(
         else:
             acc_w.extend(np.asarray(weights_by_bin[i], dtype=float).ravel().tolist())
 
-        res = combine(acc_p, weights=acc_w, eps=eps, rho=rho)
+        res = stouffer_combine(acc_p, weights=acc_w, eps=eps, rho=rho)
         running_score[i] = res["p_combined"]
 
         finite = np.asarray(acc_p, dtype=float)
@@ -747,9 +507,6 @@ def calculate_sequential_score_logit(
         running_error[i] = score_i * (1.0 - score_i) * np.sqrt(1.0 / updated_prec)
 
     return running_score, running_error
-
-
-
 
 def timer_warp(func):
     @wraps(func)
