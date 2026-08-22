@@ -251,6 +251,7 @@ def predictive_tail_kde(
     n_sim: int = 50000,
     n_obs: int = 100,
     kde: Optional[gaussian_kde] = None,
+    p_near_compute: bool = True,
 ) -> Dict[str, float]:
     """
     Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
@@ -296,6 +297,11 @@ def predictive_tail_kde(
         Paper value: N_obs = 100.
     kde : gaussian_kde or None
         Pre-fitted KDE object.  If None, a new KDE is fitted to ``sim_values``.
+    p_near_compute : bool
+        If True (default), compute P_near_KNe.  If False, the ROPE evaluation
+        is skipped entirely and ``p_near_KNe`` is returned as NaN.  P_near_KNe
+        is a purely diagnostic, per-observation quantity and never feeds the
+        cumulative score, so disabling it does not affect P_tail_KNe.
 
     Returns
     -------
@@ -304,7 +310,8 @@ def predictive_tail_kde(
         p_tail_KNe   – two-sided tail probability at M_obs (point estimate).
         p_tail_mean  – mean P_tail_KNe over n_obs M_obs uncertainty samples.
         p_tail_std   – std  P_tail_KNe over n_obs M_obs uncertainty samples.
-        p_near_KNe   – ROPE-based local consistency score P_near_KNe.
+        p_near_KNe   – ROPE-based local consistency score P_near_KNe, or NaN
+                       when ``p_near_compute`` is False.
 
     Raises
     ------
@@ -328,8 +335,11 @@ def predictive_tail_kde(
     p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
     # 3. P_near_KNe — fraction of noise-convolved PPD draws within the ROPE
-    #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
-    p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
+    #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs, so it
+    #    can be skipped without affecting anything downstream.
+    p_near_KNe = float("nan")
+    if p_near_compute:
+        p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
 
     # 4. P_tail_KNe uncertainty — sample N_obs realisations of M_obs (paper Section 2)
     #    Broadcast: (n_obs, 1) vs (n_sim,) -> (n_obs, n_sim)
@@ -549,6 +559,7 @@ def kilonovascorer_v3(
     n_kde_sim: int = 50000,
     min_sim_points: int = 20,
     overlap_k: float = 2.0,
+    p_near_compute: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -557,7 +568,8 @@ def kilonovascorer_v3(
 
     - **P_tail_KNe** — two-sided tail probability of M_obs under the
       noise-convolved PPD (with uncertainty via observation sampling).
-    - **P_near_KNe** — ROPE-based local consistency score.
+    - **P_near_KNe** — ROPE-based local consistency score (optional; see
+      ``p_near_compute``).
     - **ABC survival diagnostic** — sequential intersection of consistent
       simulation IDs across epochs (|S_t| from paper Section 3).
 
@@ -584,12 +596,18 @@ def kilonovascorer_v3(
         Minimum number of simulations required in a bin to attempt scoring.
     overlap_k : float
         ROPE half-width factor for the ABC diagnostic (sigma units).
+    p_near_compute : bool
+        If True (default), compute P_near_KNe for each observation.  If False,
+        the ROPE evaluation is skipped and the ``p_near_KNe`` column is filled
+        with NaN.  P_near_KNe is a per-observation diagnostic that is never
+        aggregated, so disabling it leaves P_tail_KNe, the cumulative score and
+        the ABC diagnostics unchanged.
 
     Returns
     -------
     results_df : pd.DataFrame
-        Per-observation metrics including P_tail_KNe, P_near_KNe, and ABC
-        diagnostics.
+        Per-observation metrics including P_tail_KNe, P_near_KNe (NaN when
+        ``p_near_compute`` is False), and ABC diagnostics.
     summary_df : pd.DataFrame
         Per-band overlap chain summary.
     """
@@ -676,6 +694,7 @@ def kilonovascorer_v3(
                 n_sim=n_kde_sim,
                 n_obs=100,      # N_obs = 100 per paper Section 2
                 kde=cached_kde,
+                p_near_compute=p_near_compute,
             )
 
             # 3c. ABC diagnostic — consistent simulation IDs at this epoch
