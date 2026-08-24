@@ -22,26 +22,101 @@ from scipy.special import expit, logit, ndtr, ndtri
 
 logger = logging.getLogger(__name__)
 
-#: Floor applied to ``p_tail_std`` before inverse-variance weighting.
-#:
-#: A categorically-rejected epoch returns ``p_tail_mean == 0`` AND
-#: ``p_tail_std == 0`` — every realisation of M_obs lands outside the simulated
-#: range, so the spread of a constant is zero.  Such an epoch carries the
-#: strongest possible evidence and must be kept, but ``w = 1/z_std**2`` divides
-#: by zero at ``s == 0``.  Flooring makes the weight large but finite.
-#:
-#: This is a SCIENTIFIC LEVER, not a numerical detail: it sets how hard a
-#: categorically-rejected bin can pull the cumulative score down.
-#:
-#: ``None`` means "use ``eps``", which is the self-consistent choice: claiming
-#: to know a probability better than the resolution it is stored at is not
-#: defensible.  It gives a rejected epoch ``z = logit(eps) = -9.21`` at
-#: ``z_std ~ 1``, i.e. unit weight — against ~25 for a well-measured epoch at
-#: ``p = 0.5 +/- 0.05``.  So a rejection drags a bin down without
-#: single-handedly deciding it.  The looser ``1/sqrt(n_obs) = 0.1`` alternative
-#: weights rejections roughly 10x less; it was not adopted, but this constant
-#: exists so the choice can be revisited without touching the arithmetic.
 P_TAIL_STD_FLOOR = None
+
+
+# ---------------------------------------------------------------------------
+# Flux-space conversions and non-detection scoring
+# ---------------------------------------------------------------------------
+
+def flux_of(M, zp=0.0):
+    """Absolute magnitude -> flux: ``F = 10**(-0.4*(M - zp))``. Monotone
+    decreasing, so brighter = larger F, opposite of magnitude. ``zp`` cancels
+    out of every probability computed from F; it only keeps values near
+    order-unity."""
+    return 10.0 ** (-0.4 * (np.asarray(M, dtype=float) - zp))
+
+
+def flux_sigma_of(M, sigma_mag, zp=0.0):
+    """Delta-method flux uncertainty from a magnitude uncertainty:
+    ``sigma_F = F * ln(10)/2.5 * sigma_mag``. Only valid for a real detection
+    -- a non-detection has no magnitude to propagate from, see
+    :func:`flux_sigma_of_limit`."""
+    F = flux_of(M, zp)
+    return F * (np.log(10.0) / 2.5) * np.asarray(sigma_mag, dtype=float)
+
+
+def flux_sigma_of_limit(M_lim, n_sigma=5.0, zp=0.0):
+    """Flux uncertainty implied by a quoted N-sigma non-detection depth:
+    ``sigma_F = flux_of(m_lim) / n_sigma``."""
+    return flux_of(M_lim, zp) / float(n_sigma)
+
+
+def _flux_score_axis(M, zp=0.0):
+    """Negated flux, for internal use by the scorer only.
+
+    The P_tail machinery assumes smaller = brighter (true of magnitude,
+    false of flux). Feeding it raw flux would flip the sign of F_hat and
+    invert the M_lim detectability weight's direction. Negating both m and
+    M_lim restores the magnitude-like convention; F_hat/P_tail/p_tail_mean/
+    P_near are all invariant to a simultaneous sign flip, so nothing else
+    needs to change.
+    """
+    return -flux_of(M, zp)
+
+
+def nondetection_tail(sim_values, M_lim, n_sigma_limit=5.0, flux_zp=0.0):
+    """P_tail for a non-detection -- a different test from P_tail_KNe, not
+    the same machinery fed an imputed measurement.
+
+    A non-detection is censored ("flux below threshold"), not a point
+    measurement at zero -- treating it as one saturates the ordinary PIT
+    (real fluxes sit many sigma above zero, so every simulation's term
+    collapses to 1 regardless of brightness; see
+    ``sim/flux_space_validate.py``). Instead this uses the standard
+    censored-data likelihood for an upper limit::
+
+        P_detect = mean_sim( Phi((F_sim - F_thresh) / sigma_phot) )
+        p_tail   = 1 - P_detect
+
+    No two-sided fold: the observed outcome (non-detection) is fixed, so
+    this is a one-sided p-value, not a PIT. It is also a BINARY-outcome
+    p-value, so it is conservative (>= Uniform(0,1)) rather than exactly
+    uniform under the null -- expected, not a bug.
+
+    Parameters
+    ----------
+    sim_values : array-like
+        Simulated absolute magnitudes for the relevant time bin.
+    M_lim : float
+        This observation's own quoted limiting absolute magnitude.
+    n_sigma_limit : float
+        Significance the depth was quoted at.
+    flux_zp : float
+        Flux zeropoint; cancels out of every probability.
+
+    Returns
+    -------
+    dict with ``F_hat`` (= P_detect), ``p_tail_KNe``, ``p_tail_mean``
+    (identical -- no jitter average here), ``p_tail_std`` (NaN),
+    ``p_near_KNe`` (NaN), ``n_eff``, ``scoreable`` (always True),
+    ``p_tail_method`` (``"nondetection"``).
+    """
+    F_sim = flux_of(np.asarray(sim_values, dtype=float), flux_zp)
+    F_thresh = flux_of(M_lim, flux_zp)
+    sigma_phot = flux_sigma_of_limit(M_lim, n_sigma_limit, flux_zp)
+    P_detect = float(ndtr((F_sim - F_thresh) / sigma_phot).mean())
+    p_tail = 1.0 - P_detect
+    return {
+        "F_hat": P_detect,
+        "p_tail_KNe": p_tail,
+        "p_tail_mean": p_tail,
+        "p_tail_std": float("nan"),
+        "p_near_KNe": float("nan"),
+        "n_eff": float(np.asarray(sim_values).size),
+        "scoreable": True,
+        "p_tail_method": "nondetection",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -217,26 +292,6 @@ def ivw_stats_logit(
         ``binned_stats_cumulative_ptail`` then deleted the entire bin on the
         strength of that missing field alone.
     """
-    # Zero scores are KEPT.  This used to open with
-    #     valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
-    # which silently deleted exactly the epochs carrying the most evidence: an
-    # epoch the simulation grid flatly excludes scores p_tail_mean == 0, and
-    # because every realisation of M_obs then lands outside the grid, the
-    # spread of that constant is p_tail_std == 0 too.  Both conditions fired,
-    # so the row was dropped — and the `(s > 0)` mask below dropped it again.
-    #
-    # The failure mode is not the fully-rejected bin, which returned 0.0 and
-    # looked wrong.  It is PARTIAL rejection, which is silent: with 4 of 5
-    # epochs rejecting the candidate, the bin scored 0.7300 — a confident
-    # kilonova-like verdict assembled from the single epoch that happened to
-    # survive the filter.  Nothing downstream can detect this, because the
-    # result is finite and plausible; the ABC survivor count in the same frame
-    # is only consulted on the NaN path, which partial rejection never reaches.
-    #
-    # `eps` was always what held zeros off the logit singularity, so the
-    # p_tail_mean filter was redundant as well as destructive.  The p_tail_std
-    # condition cannot simply be deleted — `weights = 1/z_std**2` divides by
-    # zero at s == 0 — so it is replaced by a floor (P_TAIL_STD_FLOOR).
     p = group["p_tail_mean"].to_numpy(dtype=float)
     s = group["p_tail_std"].to_numpy(dtype=float)
 
@@ -246,9 +301,7 @@ def ivw_stats_logit(
     if len(p) == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
-    # Floor s == 0 rather than dropping it.  A zero reported std means "this
-    # epoch is infinitely informative", which is never true, and it would reach
-    # the precision accumulator as 1/0**2 = inf.
+    # Floor s == 0 rather than dropping it
     floor = s_floor if s_floor is not None else P_TAIL_STD_FLOOR
     if floor is None:
         floor = eps
@@ -268,7 +321,6 @@ def ivw_stats_logit(
 
 def stouffer_combine(
     p,
-    weights=None,
     eps: float = 1e-4,
     rho: float = 0.0,
 ):
@@ -290,30 +342,32 @@ def stouffer_combine(
         Per-epoch p-values (``p_tail_mean``).  Non-finite entries are dropped.
         Zeros are KEPT and clamped to ``eps``: a categorically-rejected epoch is
         the strongest evidence available, not missing data.
-    weights : array-like or None
-        Per-epoch weights.  ``None`` (default) means equal weights, and that
-        default is now a MEASURED result rather than a placeholder — see
-        ``trove_tests/docs/WEIGHTS.md``.  Seven schemes were tested on held-out
-        kilonovae plus three contaminant classes; none beat equal weighting
-        beyond noise, and neither did the oracle weight ``w ~ mu_i`` that is
-        provably optimal by Cauchy-Schwarz.  The ceiling on any weighting gain
-        is ``sqrt(1 + CV^2)`` with CV the spread of per-epoch informativeness,
-        measured at 0.060 -> a 0.18% gain, two orders of magnitude below the
-        AUC noise floor.  Epoch informativeness is set by the grid's own
-        population spread ``tau`` (0.21-0.56 mag), which dominates ``sigma_obs``
-        and varies little across epochs.
+    Weights
+    -------
+    There are none, and that is deliberate rather than a default.  Equal
+    weighting is a MEASURED result: seven ancillary schemes were tested on
+    held-out kilonovae plus three contaminant classes (``WEIGHTS.md``) and none
+    beat it beyond noise, nor did the oracle weight ``w ~ mu_i`` that is
+    provably optimal by Cauchy-Schwarz.  The ceiling on any weighting gain is
+    ``sqrt(1 + CV^2)`` with CV the spread of per-epoch informativeness,
+    measured at 0.060 -> a 0.18% gain, two orders of magnitude under the AUC
+    noise floor.  Epoch informativeness is set by the grid's own population
+    spread ``tau`` (0.21-0.56 mag), which dominates ``sigma_obs`` and barely
+    varies across epochs, so there is little for weights to exploit.
 
-        Weights must be ANCILLARY: fixed with respect to z, i.e. functions of
-        the observing conditions only.  Any fixed positive weights leave the
-        null distribution of Z exactly standard normal, so they cannot affect
-        calibration — only power.  Weights that peek at the p-value being
-        weighted are NOT fixed and do break it: on 40000 synthetic draws,
-        ``w = 1/(p+0.01)`` gives KS 0.4316 against 0.0045 for equal weights,
-        while a fixed but extreme ``w = (1,1,1,1,1,1000)`` gives 0.0032.  In the
-        real pipeline ``w ~ 1/p_tail_std`` halves the median score of genuine
-        kilonovae (0.517 -> 0.313) and more than doubles KS (0.097 -> 0.234).
-        Do not weight by ``p_tail_std`` or anything else derived from
-        ``p_tail_mean``.
+    Weighting also costs something exact.  Stouffer accumulates like
+    ``sqrt(n_eff)`` with ``n_eff = (sum w)^2 / sum(w^2)`` (Kish), and
+    ``n_eff <= n`` for every non-uniform weighting, so unequal weights always
+    spend effective epochs for a power gain that has to be real to pay for it.
+
+    And the ``rho`` correction below stops being exact.  The scalar form
+    assumes EXCHANGEABLE correlation, under which the mean off-diagonal is the
+    off-diagonal.  Equal weights preserve that; unequal weights do not, so a
+    weighted Z would carry a normaliser that is wrong by an unknown amount.
+    Inverse-variance weights inside Stouffer were tested for exactly this and
+    rejected on that ground -- if per-epoch variances are what you want to
+    weight by, use :func:`ivw_stats_logit`, which is built for it.
+
     eps : float
         Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
     rho : float
@@ -373,46 +427,32 @@ def stouffer_combine(
         with the kilonova hypothesis, the same orientation as ``P_tail``.
     """
     p = np.asarray(p, dtype=float)
-    finite = np.isfinite(p)
-    p = p[finite]
+    p = p[np.isfinite(p)]
 
-    if weights is None:
-        w = np.ones(p.size, dtype=float)
-    else:
-        w = np.asarray(weights, dtype=float)[finite]
-        bad = ~np.isfinite(w) | (w <= 0)
-        w = np.where(bad, 0.0, w)
-
-    keep = w > 0
-    p, w = p[keep], w[keep]
-
-    if p.size == 0:
+    n = p.size
+    if n == 0:
         return {"p_combined": np.nan, "Z": np.nan, "count": 0}
 
     p_clipped = np.clip(p, eps, 1.0 - eps)
     z = ndtri(1.0 - p_clipped)          # uniform in -> standard normal out
 
-    num = float(np.sum(w * z))
-    var = float(np.sum(w ** 2))
-    if rho:
-        # cross-terms: sum_{i != j} w_i w_j = (sum w)^2 - sum w^2
-        cross = float(np.sum(w) ** 2 - np.sum(w ** 2))
-        var = var + float(rho) * cross
+    num = float(np.sum(z))
+    # Strube 1985 eq. for equal weights: Var(sum z) = n + rho*n*(n-1).
+    var = float(n) + float(rho) * float(n) * float(n - 1)
     if not np.isfinite(var) or var <= 0:
-        return {"p_combined": np.nan, "Z": np.nan, "count": int(p.size)}
+        return {"p_combined": np.nan, "Z": np.nan, "count": int(n)}
 
     Z = num / np.sqrt(var)
     return {
         "p_combined": float(ndtr(-Z)),   # 1 - Phi(Z), computed stably
         "Z": float(Z),
-        "count": int(p.size),
+        "count": int(n),
     }
 
 
 def stouffer_stats(
     group: pd.DataFrame,
     eps: float = 1e-4,
-    weight_col: Optional[str] = None,
     rho: float = 0.0,
 ) -> pd.Series:
     """
@@ -427,14 +467,6 @@ def stouffer_stats(
         the point of the change.
     eps, rho : float
         See :func:`stouffer_combine`.
-    weight_col : str or None
-        Column holding per-epoch weights.  ``None`` means equal weights, which
-        is what the power test selected: no ancillary scheme beat it beyond
-        noise and neither did the provably-optimal oracle weight.  See
-        ``trove_tests/docs/WEIGHTS.md`` and the ``weights`` note on
-        :func:`stouffer_combine`.  Any column named here must be ANCILLARY --
-        derived from observing conditions, never from ``p_tail_mean`` or
-        ``p_tail_std``.
 
     Returns
     -------
@@ -450,10 +482,7 @@ def stouffer_stats(
         cannot introduce a spurious NaN column for ``dropna`` to act on.
     """
     p = group["p_tail_mean"].to_numpy(dtype=float)
-    w = (group[weight_col].to_numpy(dtype=float)
-         if weight_col is not None and weight_col in group else None)
-
-    res = stouffer_combine(p, weights=w, eps=eps, rho=rho)
+    res = stouffer_combine(p, eps=eps, rho=rho)
     if res["count"] == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
@@ -469,7 +498,6 @@ def stouffer_stats(
 
 def calculate_sequential_score_stouffer(
     p_by_bin,
-    weights_by_bin=None,
     eps: float = 1e-4,
     rho: float = 0.0,
 ):
@@ -487,8 +515,6 @@ def calculate_sequential_score_stouffer(
     ----------
     p_by_bin : sequence of array-like
         Per-epoch p-values, grouped by time bin, in chronological order.
-    weights_by_bin : sequence of array-like or None
-        Matching per-epoch weights.  ``None`` means equal weights throughout.
     eps, rho : float
         See :func:`stouffer_combine`.
 
@@ -506,15 +532,9 @@ def calculate_sequential_score_stouffer(
     running_err = np.full(n, np.nan)
 
     acc_p: List[float] = []
-    acc_w: List[float] = []
     for i in range(n):
         acc_p.extend(np.asarray(p_by_bin[i], dtype=float).ravel().tolist())
-        if weights_by_bin is None:
-            acc_w.extend([1.0] * np.asarray(p_by_bin[i]).size)
-        else:
-            acc_w.extend(np.asarray(weights_by_bin[i], dtype=float).ravel().tolist())
-
-        res = stouffer_combine(acc_p, weights=acc_w, eps=eps, rho=rho)
+        res = stouffer_combine(acc_p, eps=eps, rho=rho)
         running_score[i] = res["p_combined"]
 
         finite = np.asarray(acc_p, dtype=float)
