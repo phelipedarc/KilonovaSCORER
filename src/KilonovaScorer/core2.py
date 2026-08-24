@@ -405,6 +405,7 @@ def predictive_tail_kde(
     p_tail_method: str = "closed_form",
     p_tail_std_method: str = "grid",
     random_state: Optional[int] = None,
+    p_near_compute: bool = True,
 ) -> Dict[str, float]:
     """
     Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
@@ -522,6 +523,11 @@ def predictive_tail_kde(
         Seed for the Monte Carlo path.  ``None`` (default) uses NumPy's global
         random state, reproducing the original behaviour exactly.  Ignored by
         the closed form, which is already deterministic.
+    p_near_compute : bool
+        If True (default), compute P_near_KNe.  If False the ROPE evaluation is
+        skipped entirely and ``p_near_KNe`` comes back NaN.  P_near_KNe is a
+        purely diagnostic, per-observation quantity that never feeds the
+        cumulative score, so disabling it cannot affect P_tail_KNe.
 
     Returns
     -------
@@ -542,7 +548,8 @@ def predictive_tail_kde(
                        Flat in N -- a sensitivity measure, not a variance.
         p_tail_mean_sens- E[P_tail] over that same noise.  Reported only; it is
                        algebraically a second convolution (see the note above).
-        p_near_KNe   - ROPE-based local consistency score P_near_KNe.
+        p_near_KNe   - ROPE-based local consistency score P_near_KNe, or
+                       NaN when ``p_near_compute`` is False.
         n_eff        - effective size of the reference actually used: N when
                        unconditioned, and the Kish effective size of the
                        detection weights when an M_lim is in force.  Computed
@@ -650,10 +657,15 @@ def predictive_tail_kde(
 
         # P_near_KNe - ROPE mass, likewise a difference of two mixture CDFs
         # (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
-        half = k * s
-        p_near_KNe = float(
-            (ndtr((M_obs + half - m) / s) - ndtr((M_obs - half - m) / s)).mean()
-        )
+        # P_near_KNe is a per-observation DIAGNOSTIC that is never aggregated,
+        # so it can be skipped outright.  (origin/trove, `p-near-optional`)
+        p_near_KNe = float("nan")
+        if p_near_compute:
+            half = k * s
+            p_near_KNe = float(
+                (ndtr((M_obs + half - m) / s)
+                 - ndtr((M_obs - half - m) / s)).mean()
+            )
 
     else:  # p_tail_method == "montecarlo" - the original estimator, unchanged
         # Fixed seed so scores are deterministic
@@ -684,7 +696,8 @@ def predictive_tail_kde(
         F_hat = float(np.mean(y_ref <= M_obs))
         p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
-        p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * s))
+        p_near_KNe = (float(np.mean(np.abs(y_dist - M_obs) <= k * s))
+                      if p_near_compute else float("nan"))
 
         M_obs_samples = rng.normal(M_obs, s, size=int(n_obs))
         F_hat_samples = (y_ref <= M_obs_samples[:, np.newaxis]).mean(axis=1)
@@ -1014,7 +1027,11 @@ def binned_stats_cumulative_ptail(
             .reset_index()
         )
         binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
-        binned_stats = binned_stats.dropna()
+        # Same narrowing as the stouffer path below, and this is the path it
+        # was written for: a bare .dropna() deletes a bin if ANY column is NaN,
+        # which is how all-zero bins used to vanish before ivw_stats_logit
+        # returned `count` on every path.  (origin/trove, `zero-epochs-handling`)
+        binned_stats = binned_stats.dropna(subset=["mean", "std"])
 
         if binned_stats.empty:
             binned_stats["running_mean"] = []
@@ -1039,7 +1056,15 @@ def binned_stats_cumulative_ptail(
         .reset_index()
     )
     binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
-    binned_stats = binned_stats.dropna(subset=["mean"])
+    # Narrowed from a bare .dropna(): with how="any" a single NaN in ANY
+    # column deleted the whole bin.  That is how all-zero bins used to vanish —
+    # ivw_stats_logit's old two-key early return left count = NaN under
+    # groupby.apply, and the bin was dropped on the strength of that missing
+    # field alone, never because its score was unusable.  Restricting the
+    # subset to the two columns the running score actually consumes means a
+    # future schema addition cannot silently start deleting bins again.
+    binned_stats = binned_stats.dropna(subset=["mean", "std"])
+
 
     if binned_stats.empty:
         binned_stats["running_mean"] = []
@@ -1410,6 +1435,7 @@ def kilonovascorer_v3(
     band_split: bool = True,
     abc_reuse_bin: bool = True,
     array_bins: bool = True,
+    p_near_compute: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -1418,7 +1444,8 @@ def kilonovascorer_v3(
 
     - **P_tail_KNe** — two-sided tail probability of M_obs under the
       noise-convolved PPD (with uncertainty via observation sampling).
-    - **P_near_KNe** — ROPE-based local consistency score.
+    - **P_near_KNe** — ROPE-based local consistency score (optional; see
+      ``p_near_compute``).
     - **ABC survival diagnostic** — sequential intersection of consistent
       simulation IDs across epochs (|S_t| from paper Section 3).
 
@@ -1590,12 +1617,18 @@ def kilonovascorer_v3(
 
         kilonovascorer_v3(..., band_split=False, abc_reuse_bin=False,
                           array_bins=False)
+    p_near_compute : bool
+        If True (default), compute P_near_KNe for each observation.  If False,
+        the ROPE evaluation is skipped and the ``p_near_KNe`` column is filled
+        with NaN.  P_near_KNe is a per-observation diagnostic that is never
+        aggregated, so disabling it leaves P_tail_KNe, the cumulative score and
+        the ABC diagnostics unchanged.
 
     Returns
     -------
     results_df : pd.DataFrame
-        Per-observation metrics including P_tail_KNe, P_near_KNe, and ABC
-        diagnostics.
+        Per-observation metrics including P_tail_KNe, P_near_KNe (NaN when
+        ``p_near_compute`` is False), and ABC diagnostics.
     summary_df : pd.DataFrame
         Per-band overlap chain summary.
     """
@@ -1780,8 +1813,9 @@ def kilonovascorer_v3(
                 M_lim=M_lim_row,
                 min_n_eff=min_n_eff,
                 p_tail_method=p_tail_method,
-                    p_tail_std_method=p_tail_std_method,
+                p_tail_std_method=p_tail_std_method,
                 random_state=random_state,
+                p_near_compute=p_near_compute,
             )
 
             # 3b. ABC diagnostic — consistent simulation IDs at this epoch.

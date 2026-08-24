@@ -22,6 +22,27 @@ from scipy.special import expit, logit, ndtr, ndtri
 
 logger = logging.getLogger(__name__)
 
+#: Floor applied to ``p_tail_std`` before inverse-variance weighting.
+#:
+#: A categorically-rejected epoch returns ``p_tail_mean == 0`` AND
+#: ``p_tail_std == 0`` — every realisation of M_obs lands outside the simulated
+#: range, so the spread of a constant is zero.  Such an epoch carries the
+#: strongest possible evidence and must be kept, but ``w = 1/z_std**2`` divides
+#: by zero at ``s == 0``.  Flooring makes the weight large but finite.
+#:
+#: This is a SCIENTIFIC LEVER, not a numerical detail: it sets how hard a
+#: categorically-rejected bin can pull the cumulative score down.
+#:
+#: ``None`` means "use ``eps``", which is the self-consistent choice: claiming
+#: to know a probability better than the resolution it is stored at is not
+#: defensible.  It gives a rejected epoch ``z = logit(eps) = -9.21`` at
+#: ``z_std ~ 1``, i.e. unit weight — against ~25 for a well-measured epoch at
+#: ``p = 0.5 +/- 0.05``.  So a rejection drags a bin down without
+#: single-handedly deciding it.  The looser ``1/sqrt(n_obs) = 0.1`` alternative
+#: weights rejections roughly 10x less; it was not adopted, but this constant
+#: exists so the choice can be revisited without touching the arithmetic.
+P_TAIL_STD_FLOOR = None
+
 
 # ---------------------------------------------------------------------------
 # Apparent → absolute magnitude conversion
@@ -145,7 +166,11 @@ def compute_abs_mag_samples(
 # Logit-space inverse-variance weighted aggregation
 # ---------------------------------------------------------------------------
 
-def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
+def ivw_stats_logit(
+    group: pd.DataFrame,
+    eps: float = 1e-4,
+    s_floor: float = None,
+) -> pd.Series:
     """
     Inverse-variance weighted mean and uncertainty in logit space.
 
@@ -168,7 +193,16 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
         ``p_tail_mean`` and ``p_tail_std`` columns.
     eps : float
         Clamping value to keep scores away from 0 and 1 before logit
-        transform (prevents infinite logit values).
+        transform (prevents infinite logit values).  Rows with
+        ``p_tail_mean == 0`` are kept and clamped to ``eps``; they are not
+        filtered out, because a categorically-rejected epoch carries the
+        strongest evidence in the bin.
+    s_floor : float or None
+        Lower bound applied to ``p_tail_std`` before the delta method, so that
+        an epoch with zero spread gets a large but finite weight instead of a
+        division by zero.  ``None`` falls back to :data:`P_TAIL_STD_FLOOR`, and
+        thence to ``eps``.  This is a scientific lever, not a numerical
+        detail — see the constant.
 
     Returns
     -------
@@ -176,42 +210,52 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
         ``mean``  – inverse-variance weighted mean (probability space).
         ``std``   – propagated uncertainty (probability space).
         ``count`` – number of valid scores used.
-    """
-    #Handling the zero scores:
-    # inside ivw_stats_logit, before computing weights:
-    valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
-    group = group[valid]
-    if group.empty:
-        # Must carry the SAME three keys as every other return path.  This
-        # branch previously returned a two-key Series {"mean", "std"}, and
-        # pandas' groupby.apply only assembles a DataFrame when the Series it
-        # collects share an index -- so as soon as one bin was fully filtered
-        # out and another was not, the result came back as a Series of Series
-        # and the caller died on `binned_stats["mean"]` with KeyError: 'mean'.
-        # That fired on exactly the objects this combiner should reject most
-        # confidently (every epoch p_tail_mean == 0), 44 of 250 simulated
-        # SN IIn/Ibn at four nights.  Returning NaN rather than 0.0 matches the
-        # `len(p) == 0` branch below and lets the caller's dropna() drop the
-        # bin, which is what the filter above already intends; it changes no
-        # number this function has ever successfully produced.
-        #
-        # The filter itself -- dropping p_tail_mean == 0 epochs that do carry
-        # rejecting power -- is a separate defect, fixed on branch
-        # `zero-epochs-handling`, not here.
-        return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
-      
-    p = group["p_tail_mean"].to_numpy()
-    s = group["p_tail_std"].to_numpy()
 
-    mask = np.isfinite(p) & np.isfinite(s) & (s > 0)
+        All return paths carry all three keys.  The previous early return
+        emitted only ``{mean, std}``, which under ``groupby(...).apply(...)``
+        produced ``count = NaN`` — and the bare ``.dropna()`` in
+        ``binned_stats_cumulative_ptail`` then deleted the entire bin on the
+        strength of that missing field alone.
+    """
+    # Zero scores are KEPT.  This used to open with
+    #     valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
+    # which silently deleted exactly the epochs carrying the most evidence: an
+    # epoch the simulation grid flatly excludes scores p_tail_mean == 0, and
+    # because every realisation of M_obs then lands outside the grid, the
+    # spread of that constant is p_tail_std == 0 too.  Both conditions fired,
+    # so the row was dropped — and the `(s > 0)` mask below dropped it again.
+    #
+    # The failure mode is not the fully-rejected bin, which returned 0.0 and
+    # looked wrong.  It is PARTIAL rejection, which is silent: with 4 of 5
+    # epochs rejecting the candidate, the bin scored 0.7300 — a confident
+    # kilonova-like verdict assembled from the single epoch that happened to
+    # survive the filter.  Nothing downstream can detect this, because the
+    # result is finite and plausible; the ABC survivor count in the same frame
+    # is only consulted on the NaN path, which partial rejection never reaches.
+    #
+    # `eps` was always what held zeros off the logit singularity, so the
+    # p_tail_mean filter was redundant as well as destructive.  The p_tail_std
+    # condition cannot simply be deleted — `weights = 1/z_std**2` divides by
+    # zero at s == 0 — so it is replaced by a floor (P_TAIL_STD_FLOOR).
+    p = group["p_tail_mean"].to_numpy(dtype=float)
+    s = group["p_tail_std"].to_numpy(dtype=float)
+
+    mask = np.isfinite(p) & np.isfinite(s) & (s >= 0.0)
     p, s = p[mask], s[mask]
 
     if len(p) == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
+    # Floor s == 0 rather than dropping it.  A zero reported std means "this
+    # epoch is infinitely informative", which is never true, and it would reach
+    # the precision accumulator as 1/0**2 = inf.
+    floor = s_floor if s_floor is not None else P_TAIL_STD_FLOOR
+    if floor is None:
+        floor = eps
     p_clipped = np.clip(p, eps, 1.0 - eps)
+    s_floored = np.maximum(s, floor)
     z     = logit(p_clipped)
-    z_std = s / (p_clipped * (1.0 - p_clipped))    # delta method
+    z_std = s_floored / (p_clipped * (1.0 - p_clipped))    # delta method
     weights = 1.0 / z_std ** 2
 
     z_mean     = np.sum(weights * z) / np.sum(weights)
@@ -519,22 +563,44 @@ def calculate_sequential_score_logit(
     running_error : np.ndarray
         Propagated uncertainty on the cumulative score (probability space).
     """
+    means = np.asarray(means, dtype=float)
+    stds  = np.asarray(stds, dtype=float)
+
     n = len(means)
-    running_score = np.zeros(n)
-    running_error = np.zeros(n)
+    running_score = np.full(n, np.nan)
+    running_error = np.full(n, np.nan)
+
+    if n == 0:
+        return running_score, running_error
 
     means_clipped = np.clip(means, eps, 1.0 - eps)
     z     = logit(means_clipped)
     z_std = stds / (means_clipped * (1.0 - means_clipped))  # delta method
 
-    # Initialise from first bin
-    current_z    = z[0]
-    current_prec = 1.0 / z_std[0] ** 2
-    running_score[0] = float(means_clipped[0])
-    running_error[0] = float(stds[0])
+    # A bin is usable only if its precision 1/z_std**2 is finite AND positive.
+    # Testing np.isfinite(z_std) alone is not enough: 0.0 is finite, so a
+    # zero-variance bin passed the old check and produced infinite precision.
+    # The update (finite*finite + z*inf) / inf then evaluates to NaN, and every
+    # subsequent bin inherits it.
+    valid = np.isfinite(z) & np.isfinite(z_std) & (z_std > 0.0)
 
-    for i in range(1, n):
-        if not np.isfinite(z[i]) or not np.isfinite(z_std[i]):
+    # Initialise from the first VALID bin, not unconditionally from bin 0.
+    # Bin 0 was never checked, so a single bad first bin set current_prec to inf
+    # and NaN-poisoned the entire running score.  Bins before the first valid
+    # one are reported NaN rather than given a fabricated value.
+    first = int(np.argmax(valid)) if valid.any() else -1
+    if first < 0:
+        # No usable bin.  Return all-NaN rather than indexing z[0], which used
+        # to raise IndexError on an empty frame.
+        return running_score, running_error
+
+    current_z    = z[first]
+    current_prec = 1.0 / z_std[first] ** 2
+    running_score[first] = float(means_clipped[first])
+    running_error[first] = float(stds[first])
+
+    for i in range(first + 1, n):
+        if not valid[i]:
             # Carry forward without update
             running_score[i] = running_score[i - 1]
             running_error[i] = running_error[i - 1]
