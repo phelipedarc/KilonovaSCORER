@@ -229,7 +229,16 @@ def stouffer_combine(
     rho: float = 0.0,
 ):
     """
-    Combine p-values by the weighted Stouffer method.
+    Combine p-values by the weighted Stouffer method, with Strube's
+    correlation correction.
+
+    ``rho = 0`` is Stouffer (1949); ``rho > 0`` is **Strube's method** (Strube
+    1985, *Psychological Bulletin* 97, 334-341), the generalisation of Stouffer
+    to non-independent tests.  Both are the same function because they differ
+    only in the normaliser -- see ``rho`` below.  The name stays
+    ``stouffer_combine`` because that is what it is at the default, and because
+    a correlation argument on Stouffer is the standard interface (R's ``poolr``
+    spells it ``stouffer(..., adjust=)``).
 
     Parameters
     ----------
@@ -264,18 +273,54 @@ def stouffer_combine(
     eps : float
         Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
     rho : float
-        Exchangeable inter-epoch correlation, used to correct the normaliser::
+        Exchangeable inter-epoch correlation of the normal scores.  ``0.0``
+        (the default) assumes independence; any positive value applies
+        **Strube's correction** to the normaliser::
 
             Var(sum w_i z_i) = sum_i sum_j w_i w_j rho_ij
+                             = sum(w^2) + rho * [ (sum w)^2 - sum(w^2) ]
 
-        Epochs of one candidate are genuinely correlated — same object, smooth
-        light curve, one shared distance — with a measured mean of 0.284.
+        which for equal weights reduces to Strube's published form
+        ``Z = sum(z) / sqrt(n + rho*n*(n-1))``.
+
+        Epochs of one candidate ARE correlated -- same object, one smooth light
+        curve, one shared distance draw -- with a mean of **0.284** measured on
+        the grid.  Measure it for a given candidate with
+        :func:`KilonovaScorer.core2.estimate_rho`, which evaluates the
+        correlation at that candidate's own cadence rather than borrowing a
+        number.
+
         Positive correlation makes the true variance larger than ``sum(w^2)``,
-        so the default ``rho = 0`` is OVERCONFIDENT by a known direction.  It is
-        left at 0 because the well-founded estimate of rho (from the grid, at
-        this candidate's own cadence) is not implemented yet, and borrowing one
-        number from the literature would be a guess wearing a measurement's
-        clothes.
+        so ``rho = 0`` is **overconfident by a known direction**.  Measured on
+        20,000 exchangeably-correlated nulls of six epochs, KS against U(0,1)
+        (5% critical value 0.0096):
+
+        =========  =================  ==================
+        true rho   Stouffer (rho=0)   Strube (rho=true)
+        =========  =================  ==================
+        0.000                 0.0090              0.0090
+        0.100                 0.0535              0.0069
+        0.284                 0.1111              0.0065
+        0.500                 0.1495              0.0059
+        0.800                 0.1874              0.0053
+        =========  =================  ==================
+
+        Strube holds calibration at every correlation; uncorrected Stouffer is
+        outside the critical value as soon as rho exceeds ~0.05.
+
+        rho is estimated, so misspecification matters.  At a true rho of 0.284,
+        passing 0.0 gives KS 0.1036 and 0.2 gives 0.0232, while 0.4 gives 0.0283
+        and 0.9 gives 0.1009.  **Erring high is safe and erring low is not** --
+        too large a rho is merely conservative (the score rises), too small
+        leaves the overconfidence it was meant to remove.
+
+        It costs no power.  At fixed ``n`` the correction divides Z by a
+        constant, so it is a monotone transform: the candidate ordering and the
+        AUC are unchanged to machine precision.  What it changes is the
+        comparison ACROSS candidates with different epoch counts, where
+        uncorrected Stouffer keeps crediting every extra correlated epoch as
+        independent evidence -- at 48 epochs it is optimistic by 796x relative
+        to Strube, against 1.1x at two epochs.
 
     Returns
     -------

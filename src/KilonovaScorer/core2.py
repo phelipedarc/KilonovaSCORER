@@ -1,36 +1,3 @@
-"""
-core.py — KilonovaScorer core pipeline.
-
-Implements:
-  - JSON / CSV photometry loading with absolute magnitude computation
-  - LSST-like cadence downsampling
-  - P_tail_KNe and P_near_KNe scoring on the noise-convolved PPD
-    (predictive_tail_kde), by exact error-function sums or by the original
-    KDE Monte Carlo, selected with ``p_tail_method``
-  - Optional conditioning of the reference on detectability, selected with
-    ``M_lim``
-  - ABC sequential survival diagnostic (overlap_chain), skippable with
-    ``abc_compute``
-  - Partition reuse in the band loop, in the time-bin split and in the ABC
-    diagnostic, selected with ``band_split``, ``array_bins`` and
-    ``abc_reuse_bin`` -- speed only, outputs identical
-  - Cumulative scoring by Stouffer p-value combination or by the original
-    logit-space inverse-variance weighted mean, selected with ``method``
-    (binned_stats_cumulative_ptail)
-
-Every change made to the scoring since the paper is SELECTABLE rather than
-substituted: the defaults are the new behaviour, and the previous behaviour is
-reproduced exactly by
-
-    kilonovascorer_v3(..., p_tail_method="montecarlo", M_lim=None,
-                      band_split=False, abc_reuse_bin=False, array_bins=False)
-    binned_stats_cumulative_ptail(..., method="ivw")
-
-Scoring in FLUX rather than absolute magnitude is designed and measured in
-REPORT.md Parts VIII-IX but is deliberately NOT implemented here; it belongs on
-its own branch.
-"""
-
 # ---------------------------------------------------------------------------
 # Standard library
 # ---------------------------------------------------------------------------
@@ -55,22 +22,6 @@ from .utils import *  # noqa: F401,F403  (decorators and helpers)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-#
-# EXPLICIT, because ``KilonovaScorer/__init__.py`` does ``from .core2 import *``
-# and several names here collide with older ones in ``core.py``.  Without an
-# ``__all__`` the star-import re-exported every public name in this module's
-# namespace — including everything pulled in by ``from .utils import *`` — and
-# which definition of ``binned_stats_cumulative_ptail`` the package exposed
-# depended on nothing more than the ORDER of the two import lines in
-# ``__init__.py``.  Reordering them would have silently reverted the whole
-# pipeline from Stouffer p-value combination back to the legacy IVW mean.
-#
-# The ``utils`` helpers are listed here deliberately: they were already part of
-# the package's public surface via the transitive star-import, so omitting them
-# would be a silent API removal rather than a tidy-up.
 __all__ = [
     # --- core2's own API ---
     "P_TAIL_METHODS",
@@ -100,12 +51,31 @@ __all__ = [
 # Progress bar
 # ---------------------------------------------------------------------------
 
+#: Set once the stream is found unable to encode the block characters, so the
+#: encoding is probed once rather than once per observation.
+# TODO: Is this really necessary?
+_ASCII_BAR = False
+
+
 def arcade_progress_bar(current: int, total: int, bar_length: int = 30) -> None:
-    """Print an arcade-style progress bar to stdout."""
+    "Print an arcade-style progress bar to stdout."
+    global _ASCII_BAR
     percent = current / total
     filled = int(bar_length * percent)
-    bar = "█" * filled + "-" * (bar_length - filled)
-    sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}% ⬛")
+
+    if not _ASCII_BAR:
+        bar = "█" * filled + "-" * (bar_length - filled)
+        try:
+            sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}% ⬛")
+            sys.stdout.flush()
+            if current == total:
+                sys.stdout.write("\n")
+            return
+        except UnicodeEncodeError:
+            _ASCII_BAR = True
+
+    bar = "#" * filled + "-" * (bar_length - filled)
+    sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}%")
     sys.stdout.flush()
     if current == total:
         sys.stdout.write("\n")
@@ -324,31 +294,102 @@ def preprocess_lsst_like(
 #: that results published against it remain reproducible and so that the two can
 #: be compared on the same data.  See :func:`predictive_tail_kde`.
 P_TAIL_METHODS = ("closed_form", "montecarlo")
-
-#: Historical / convenience spellings.  ``kde`` is accepted because that is what
-#: this function is named after.
-_P_TAIL_ALIASES = {
-    "closed-form": "closed_form",
-    "closedform": "closed_form",
-    "exact": "closed_form",
-    "mc": "montecarlo",
-    "monte_carlo": "montecarlo",
-    "monte-carlo": "montecarlo",
-    "kde": "montecarlo",
-    "legacy": "montecarlo",
-}
+#: What ``p_tail_std`` is allowed to hold.  "grid" is the finite-grid
+#: standard error of F_hat (an estimation error: falls as 1/sqrt(N)).
+#: "sensitivity" is the spread of P_tail over measurement noise on M_obs
+#: (a sensitivity analysis: flat in N).  Both are always emitted under
+#: their own names; this only selects the alias.
+P_TAIL_STD_METHODS = ("grid", "sensitivity")
 
 
-def _resolve_p_tail_method(p_tail_method: str) -> str:
-    """Normalise and validate a ``p_tail_method`` argument."""
-    key = str(p_tail_method).strip().lower()
-    key = _P_TAIL_ALIASES.get(key, key)
-    if key not in P_TAIL_METHODS:
-        raise ValueError(
-            "p_tail_method must be one of %r (aliases: %r); got %r."
-            % (P_TAIL_METHODS, sorted(_P_TAIL_ALIASES), p_tail_method)
-        )
-    return key
+#: Gauss-Hermite nodes for E[f(sigma * Z)], Z ~ N(0,1).  Used on the fast path
+#: only -- where the two-sided fold does not bite inside the integration range.
+_GH_NODES, _GH_WEIGHTS = np.polynomial.hermite_e.hermegauss(64)
+_GH_WSUM = float(_GH_WEIGHTS.sum())
+
+#: Gauss-Legendre nodes on [-1, 1], used per panel when the fold DOES bite.
+_GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(48)
+
+#: How many sigma of measurement noise to integrate over.  Beyond 8 the normal
+#: density contributes < 1e-15 and the truncation is far below every other
+#: error in the pipeline.
+_SENS_RANGE = 8.0
+
+
+def _F_of(m, x, s, w_sum=None):
+    """F(x) under the population `m` convolved with N(0, s^2), vectorised in x."""
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    phi = ndtr((x[:, None] - m[None, :]) / s)
+    if w_sum:
+        return np.clip(phi.sum(axis=1) / w_sum, 0.0, 1.0)
+    return phi.mean(axis=1)
+
+
+def _sensitivity_moments(m, M_obs, s, w=None, w_sum=None):
+    """Mean and sd of P_tail over measurement noise on M_obs.
+
+    Answers "how much would this epoch's score move if the measurement had
+    landed elsewhere within sigma_obs" -- a sensitivity analysis, and a
+    different question from "how well is the reference population resolved"
+    (which is the finite-grid standard error reported beside it).
+
+    Deterministic quadrature in place of the N_obs jitter loop: the same
+    quantity, with no Monte Carlo error and ~300x cheaper.
+
+    THE FOLD IS INTEGRATED AROUND, NOT THROUGH.  ``P_tail = 2 min(F, 1-F)`` has
+    a kink where F = 0.5.  F is monotone in the shift, so that crossing is
+    unique; it is located by bisection and each side is integrated separately
+    with Gauss-Legendre, which keeps both integrands smooth.  Quadrating
+    straight across the kink with Gauss-Hermite was still moving in the 3rd
+    decimal at 256 nodes.
+
+    NOTE WHAT THIS IS NOT: it does not shrink as the grid grows, so it is not
+    an estimation variance and must not become an inverse-variance weight.
+    See sim/sigma_obs_twice_proof.py part 4.
+    """
+    m = np.asarray(m, dtype=float)
+    lo, hi = -_SENS_RANGE * s, _SENS_RANGE * s
+
+    # Where does F(M_obs + eta) cross 0.5?  Monotone in eta, so bisect.
+    F_lo = float(_F_of(m, M_obs + lo, s, w_sum)[0])
+    F_hi = float(_F_of(m, M_obs + hi, s, w_sum)[0])
+    if (F_lo - 0.5) * (F_hi - 0.5) > 0.0:
+        # No fold inside the range: P_tail is smooth here, use Gauss-Hermite.
+        F = _F_of(m, M_obs + s * _GH_NODES, s, w_sum)
+        p = 2.0 * np.minimum(F, 1.0 - F)
+        mean = float(np.dot(_GH_WEIGHTS, p) / _GH_WSUM)
+        var = float(np.dot(_GH_WEIGHTS, (p - mean) ** 2) / _GH_WSUM)
+        return mean, float(np.sqrt(max(var, 0.0)))
+
+    a, b = lo, hi
+    for _ in range(80):
+        mid = 0.5 * (a + b)
+        if float(_F_of(m, M_obs + mid, s, w_sum)[0]) < 0.5:
+            a = mid
+        else:
+            b = mid
+    kink = 0.5 * (a + b)
+
+    # Two panels, each smooth, each weighted by the normal density of eta.
+    num_m = num_v = norm = 0.0
+    panels = []
+    for u0, u1 in ((lo, kink), (kink, hi)):
+        if u1 - u0 <= 0.0:
+            continue
+        half, mid = 0.5 * (u1 - u0), 0.5 * (u1 + u0)
+        eta = mid + half * _GL_NODES
+        dens = np.exp(-0.5 * (eta / s) ** 2)          # normalisation cancels
+        wq = _GL_WEIGHTS * half * dens
+        F = _F_of(m, M_obs + eta, s, w_sum)
+        panels.append((wq, 2.0 * np.minimum(F, 1.0 - F)))
+        norm += float(wq.sum())
+        num_m += float(np.dot(wq, panels[-1][1]))
+    if norm <= 0.0:
+        return float("nan"), float("nan")
+    mean = num_m / norm
+    for wq, p in panels:
+        num_v += float(np.dot(wq, (p - mean) ** 2))
+    return mean, float(np.sqrt(max(num_v / norm, 0.0)))
 
 
 def predictive_tail_kde(
@@ -362,6 +403,7 @@ def predictive_tail_kde(
     M_lim: Optional[float] = None,
     min_n_eff: float = 20.0,
     p_tail_method: str = "closed_form",
+    p_tail_std_method: str = "grid",
     random_state: Optional[int] = None,
 ) -> Dict[str, float]:
     """
@@ -376,6 +418,67 @@ def predictive_tail_kde(
     and the ROPE-based local consistency score (paper eq. 4)::
 
         P_near_KNe = Pr(M_rep in [M_obs - k*sigma_obs, M_obs + k*sigma_obs])
+
+    TWO ESTIMATORS, SELECTED BY ``p_tail_method``
+    ---------------------------------------------
+    Neither is removed; the default changed.  They do NOT target quite the same
+    integral, and the difference is not negligible: the closed form integrates
+    against the EMPIRICAL grid, while ``montecarlo`` integrates against a
+    KDE-SMOOTHED version of it, so the Monte Carlo reference is wider by the
+    kernel bandwidth h. Feeding the closed form
+    ``sqrt(sigma_obs^2 + h^2)`` reproduces the Monte Carlo result to within its
+    own Monte Carlo error.
+
+    TWO UNCERTAINTIES, BOTH REPORTED, UNDER SEPARATE NAMES
+    ------------------------------------------------------
+    There are two defensible numbers here and they are NOT two estimates of one
+    thing.  Both are now emitted on every row, under names that cannot be
+    confused, and ``p_tail_std_method`` only selects which one the legacy
+    ``p_tail_std`` alias carries.
+
+    ``p_tail_se_grid`` -- FINITE-GRID STANDARD ERROR of F_hat.  The ``m_i`` are
+    N draws from the prior over ejecta parameters, so F_hat is a sample mean and
+    carries a genuine estimator error.  It falls as ``1/sqrt(N_eff)``, using the
+    EFFECTIVE count that survives the ``M_lim`` detection cut via the ``sum(w)``
+    denominator of the ratio-estimator form -- so a shallow epoch carries a
+    larger error than a deep one at the same raw grid size.  Computed
+    identically on both ``p_tail_method`` branches, because it is a property of
+    the grid rather than of the estimator.
+
+    ``p_tail_std_sens`` -- MEASUREMENT-SENSITIVITY SPREAD, the standard
+    deviation of P_tail over ``M_obs + eta``, ``eta ~ N(0, sigma_obs^2)``.  It
+    answers *"how much would this epoch's score move if the measurement had
+    landed elsewhere within its error?"* -- a sensitivity analysis, and a
+    perfectly legitimate one.  This is the quantity the paper's ``N_obs = 100``
+    jitter loop estimates.  Under ``closed_form`` it is computed by quadrature
+    instead: deterministic, no Monte Carlo error, ~120x cheaper, and validated
+    against a 200,000-draw brute-force Monte Carlo in
+    ``sim/ptail_std_validate.py`` (worst disagreement 5.8e-04, below the Monte
+    Carlo's own 2.2e-03 standard error).
+
+    WHICH ONE IS AN "UNCERTAINTY" DEPENDS ON THE QUESTION, AND ONLY ONE OF THEM
+    IS A VARIANCE.  ``p_tail_se_grid`` shrinks when you generate more
+    simulations; ``p_tail_std_sens`` does not -- measured flat across a 16x
+    change in N.  So the sensitivity spread is reportable and informative, but
+    it must NOT be used as an inverse-variance weight: it is a monotone function
+    of the score itself, and weighting by it makes an epoch's contribution to
+    ``sum(w z)`` FALL as the epoch becomes more informative (measured: a 13.6x
+    collapse between P_tail = 0.20 and P_tail = 0.004).  See
+    ``sim/sigma_obs_twice_proof.py`` part 4.
+
+    ``p_tail_mean_sens`` -- ``E_eta[P_tail]``, also emitted, also never read by
+    the scoring path.  By the convolution identity
+    ``E_eta[F_h(M_obs + eta)] == F_sqrt(h^2+sigma^2)(M_obs)`` this mean is
+    evaluated against a reference of width ``sqrt(2)*sigma_obs``, so feeding it
+    to the combiner would silently widen the reference by a factor nobody set.
+    It is reported so the size of that effect stays visible.  ``p_tail_mean``
+    stays equal to ``p_tail_KNe`` (paper eq. 7) under the closed form.
+
+    Under the default Stouffer combiner none of these are read by the scoring
+    path -- see ``stouffer_combine`` in utils.py.  ``p_tail_std`` sets the
+    weights solely on the legacy ``method='ivw'`` branch, which is why
+    ``p_tail_std_method`` defaults to ``"grid"``: switching it changes those
+    weights, and that should be an explicit choice.
 
     Parameters
     ----------
@@ -406,8 +509,15 @@ def predictive_tail_kde(
         Minimum effective reference size below which the observation is
         reported as unscoreable.  Applied only when ``M_lim`` is supplied.
     p_tail_method : {"closed_form", "montecarlo"}
-        Estimator, as above.  ``"kde"`` and ``"legacy"`` are accepted aliases
-        for ``"montecarlo"``.
+        Estimator, as above.  Exactly one of ``P_TAIL_METHODS``; anything else
+        raises.
+    p_tail_std_method : {"grid", "sensitivity"}
+        Which of the two uncertainties the ``p_tail_std`` alias carries.  Both
+        are always emitted under ``p_tail_se_grid`` and ``p_tail_std_sens``
+        regardless; this only picks the alias.  Defaults to ``"grid"`` because
+        ``p_tail_std`` is read as an inverse-variance WEIGHT on the legacy
+        ``method='ivw'`` combiner, and changing what it holds changes those
+        weights.
     random_state : int or None
         Seed for the Monte Carlo path.  ``None`` (default) uses NumPy's global
         random state, reproducing the original behaviour exactly.  Ignored by
@@ -421,10 +531,17 @@ def predictive_tail_kde(
         p_tail_KNe   - two-sided tail probability at M_obs.
         p_tail_mean  - closed form: identical to p_tail_KNe.  Monte Carlo: mean
                        of P_tail over the n_obs M_obs realisations.
-        p_tail_std   - closed form: finite-grid standard error of p_tail_KNe,
-                       2*se(F_hat) with se(F_hat) = sqrt(sum (phi - F w)^2) /
-                       sum(w), floored at 1/n_eff.  Monte Carlo: standard
-                       deviation of P_tail over the n_obs realisations.
+        p_tail_std   - alias for whichever of the next two ``p_tail_std_method``
+                       selects.  Default "grid".
+        p_tail_se_grid- finite-grid standard error, 2*se(F_hat) with
+                       se(F_hat) = sqrt(sum (phi - F w)^2) / sum(w), floored at
+                       1/n_eff.  Falls as 1/sqrt(N).
+        p_tail_std_sens- sd of P_tail over measurement noise on M_obs.  Closed
+                       form: quadrature, panels split at the F = 0.5 fold.
+                       Monte Carlo: sd over the n_obs jittered realisations.
+                       Flat in N -- a sensitivity measure, not a variance.
+        p_tail_mean_sens- E[P_tail] over that same noise.  Reported only; it is
+                       algebraically a second convolution (see the note above).
         p_near_KNe   - ROPE-based local consistency score P_near_KNe.
         n_eff        - effective size of the reference actually used: N when
                        unconditioned, and the Kish effective size of the
@@ -443,10 +560,23 @@ def predictive_tail_kde(
     sim_values = np.asarray(sim_values)
     if sim_values.size == 0:
         raise ValueError("sim_values cannot be empty.")
-    if sigma_obs <= 0:
-        raise ValueError("sigma_obs must be positive.")
 
-    p_tail_method = _resolve_p_tail_method(p_tail_method)
+    if not (sigma_obs > 0):
+        raise ValueError(
+            "sigma_obs must be positive and finite; got %r." % (sigma_obs,)
+        )
+
+    if p_tail_method not in P_TAIL_METHODS:
+        raise ValueError(
+            "p_tail_method must be one of %r; got %r."
+            % (P_TAIL_METHODS, p_tail_method)
+        )
+
+    if p_tail_std_method not in P_TAIL_STD_METHODS:
+        raise ValueError(
+            "p_tail_std_method must be one of %r; got %r."
+            % (P_TAIL_STD_METHODS, p_tail_std_method)
+        )
 
     m = np.asarray(sim_values, dtype=float)
     s = float(sigma_obs)
@@ -465,9 +595,10 @@ def predictive_tail_kde(
         if use_limit:
             w = ndtr((float(M_lim) - m) / s)      # Pr(simulation i is detectable)
             w_sum = float(w.sum())
-            if w_sum > 0.0:
+            w_sq = float(np.sum(w ** 2))
+            if w_sum > 0.0 and w_sq > 0.0:
                 F_hat = float(np.clip(phi.sum() / w_sum, 0.0, 1.0))
-                n_eff = float(w_sum ** 2 / np.sum(w ** 2))
+                n_eff = float(w_sum ** 2 / w_sq)
             else:
                 limit_degenerate = True
                 n_eff = 0.0
@@ -479,6 +610,13 @@ def predictive_tail_kde(
         p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
         p_tail_mean = p_tail_KNe
 
+        # --- finite-grid standard error of F_hat ----------------------------
+        # Spelled in the ratio-estimator form  sqrt(sum (phi - F w)^2) / sum(w),
+        # which makes the EFFECTIVE-N scaling explicit.  The denominator is
+        # sum(w), the detection-weighted grid size, so a shallow epoch whose
+        # M_lim cut leaves few detectable simulations gets a correspondingly
+        # larger error.
+
         n_grid = m.size
         if n_grid > 1:
             if use_limit:
@@ -489,10 +627,26 @@ def predictive_tail_kde(
         else:
             se_F = 0.0
 
+
         if n_eff > 0.0:
             se_F = max(se_F, 1.0 / float(n_eff))
 
-        p_tail_std = float(min(2.0 * se_F, 1.0))
+        # P_tail is a probability; its standard error cannot exceed the range.
+        p_tail_se_grid = float(min(2.0 * se_F, 1.0))
+
+        # Measurement-sensitivity spread -- the quantity the N_obs jitter loop
+        # estimates, here in closed form.  Reported, never fed to the score:
+        # p_tail_mean_sens is E_eta[P_tail], which by the convolution identity
+        # is evaluated against a reference of width sqrt(2)*sigma_obs, so using
+        # it as the score would widen the reference by a factor nobody set.
+        p_tail_mean_sens, p_tail_std_sens = _sensitivity_moments(
+            m, M_obs, s,
+            w=(w if use_limit else None),
+            w_sum=(w_sum if use_limit else None),
+        )
+
+        p_tail_std = (p_tail_se_grid if p_tail_std_method == "grid"
+                      else p_tail_std_sens)
 
         # P_near_KNe - ROPE mass, likewise a difference of two mixture CDFs
         # (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
@@ -502,6 +656,7 @@ def predictive_tail_kde(
         )
 
     else:  # p_tail_method == "montecarlo" - the original estimator, unchanged
+        # Fixed seed so scores are deterministic
         rng = np.random if random_state is None else np.random.default_rng(random_state)
 
         if kde is None:
@@ -515,11 +670,12 @@ def predictive_tail_kde(
         if use_limit:
             w = ndtr((float(M_lim) - m) / s)   # Pr(simulation i is detectable)
             w_sum = float(w.sum())
+            w_sq = float(np.sum(w ** 2))       # see the closed form on why
             keep = y_dist <= float(M_lim)
             n_keep = int(np.count_nonzero(keep))
-            if w_sum > 0.0 and n_keep > 0:
+            if w_sum > 0.0 and w_sq > 0.0 and n_keep > 0:
                 y_ref = y_dist[keep]
-                n_eff = float(w_sum ** 2 / np.sum(w ** 2))
+                n_eff = float(w_sum ** 2 / w_sq)
             else:
                 limit_degenerate = True
                 n_eff = 0.0
@@ -534,21 +690,49 @@ def predictive_tail_kde(
         F_hat_samples = (y_ref <= M_obs_samples[:, np.newaxis]).mean(axis=1)
         p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
         p_tail_mean = float(np.mean(p_tail_samples))
-        p_tail_std = float(np.std(p_tail_samples))
+        p_tail_mean_sens = p_tail_mean
+        p_tail_std_sens = float(np.std(p_tail_samples))
+
+        # The finite-grid error is a property of the GRID, not of the
+        # estimator, so it is computed the same way on both branches -- that is
+        # what makes the two columns comparable across p_tail_method.
+        phi_g = ndtr((M_obs - m) / s)
+        if use_limit:
+            w_g = ndtr((float(M_lim) - m) / s)
+            wg_sum = float(w_g.sum())
+            R_raw = float(phi_g.sum() / wg_sum) if wg_sum > 0 else 0.0
+            se_F = (float(np.sqrt(np.sum((phi_g - R_raw * w_g) ** 2)) / wg_sum)
+                    if wg_sum > 0 else 0.0)
+        else:
+            se_F = float(np.sqrt(np.sum((phi_g - phi_g.mean()) ** 2)) / m.size)
+        if n_eff > 0.0:
+            se_F = max(se_F, 1.0 / float(n_eff))
+        p_tail_se_grid = float(min(2.0 * se_F, 1.0))
+
+        p_tail_std = (p_tail_se_grid if p_tail_std_method == "grid"
+                      else p_tail_std_sens)
 
     scoreable = True
+    if not np.isfinite(M_obs):
+        scoreable = False
     if limit_requested:
-        scoreable = (not limit_degenerate) and n_eff >= float(min_n_eff)
+        scoreable = scoreable and (not limit_degenerate) and n_eff >= float(min_n_eff)
     if not scoreable:
         p_tail_KNe = float("nan")
         p_tail_mean = float("nan")
         p_tail_std = float("nan")
+        p_tail_se_grid = float("nan")
+        p_tail_std_sens = float("nan")
+        p_tail_mean_sens = float("nan")
 
     return {
         "F_hat": F_hat,
         "p_tail_KNe": p_tail_KNe,
         "p_tail_mean": p_tail_mean,
         "p_tail_std": p_tail_std,
+        "p_tail_se_grid": p_tail_se_grid,
+        "p_tail_std_sens": p_tail_std_sens,
+        "p_tail_mean_sens": p_tail_mean_sens,
         "p_near_KNe": p_near_KNe,
         "n_eff": n_eff,
         "scoreable": bool(scoreable),
@@ -791,9 +975,15 @@ def binned_stats_cumulative_ptail(
         conditions only, never of ``p_tail_mean`` or ``p_tail_std``.  Ignored by
         ``method="ivw"``, which sets its own weights.
     rho : float
-        Mean inter-epoch correlation of the normal scores, used by Stouffer to
-        avoid treating correlated epochs as independent.  ``0.0`` (default)
-        assumes independence.  Ignored by ``method="ivw"``.
+        Mean inter-epoch correlation of the normal scores.  ``0.0`` (default)
+        assumes independence and gives plain Stouffer; a positive value applies
+        **Strube's method** (Strube 1985), the correlation-corrected Stouffer --
+        see ``stouffer_combine`` in utils.py for the formula and the measured
+        calibration.  Obtain the value from :func:`estimate_rho` rather than
+        guessing; the grid-measured mean is 0.284, at which uncorrected
+        Stouffer is measurably overconfident (KS 0.1111 against Strube's
+        0.0065).  Ignored by ``method="ivw"``, which has no correlation
+        correction available at all.
 
     Returns
     -------
@@ -825,6 +1015,11 @@ def binned_stats_cumulative_ptail(
         )
         binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
         binned_stats = binned_stats.dropna()
+
+        if binned_stats.empty:
+            binned_stats["running_mean"] = []
+            binned_stats["running_std"] = []
+            return binned_stats
 
         running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
             binned_stats["mean"].values,
@@ -942,29 +1137,43 @@ def _epoch_grid(metric_df, data_sim, time_bin_width=0.2, sigma_col=None):
         return None, None, None, rows
 
     cols, sig, lim, keep = [], [], [], []
-    for r in rows.itertuples(index=False):
+    for i, r in enumerate(rows.itertuples(index=False)):
         band = data_sim[data_sim["filter_mapped"] == r.band]
         if band.empty:
             continue
         lo = getattr(r, "time_bin_low", r.obs_time - time_bin_width / 2)
         hi = getattr(r, "time_bin_high", r.obs_time + time_bin_width / 2)
-        sub = band[(band["time"] > lo) & (band["time"] <= hi)]
-        if sub.empty:
-            sub = band.iloc[(band["time"] - r.obs_time).abs().argsort()[:0]]
-        if sub.empty:
+        window = band[(band["time"] > lo) & (band["time"] <= hi)]
+        if window.empty:
+            # No grid point inside this epoch's bin, so the epoch cannot be
+            # simulated and is dropped.  A nearest-neighbour fallback used to be
+            # attempted here as `band.iloc[...argsort()[:0]]`, which selects
+            # ZERO rows and so was never anything but this `continue`.
             continue
-        s = sub.groupby("sample_id")["absolute_magnitude"].mean()
-        cols.append(s)
-        sigma = getattr(r, sigma_col) if sigma_col else r.observed_mag_err
-        sig.append(float(sigma))
+        cols.append(window.groupby("sample_id")["absolute_magnitude"].mean())
+
+        # getattr with a default: a sigma_col naming a column this frame does
+        # not have used to raise AttributeError from inside the loop.
+        sigma = getattr(r, sigma_col, None) if sigma_col else None
+        sig.append(float(r.observed_mag_err if sigma is None else sigma))
+
+        # None is not NaN: np.isfinite(None) raises, and a hand-built metric_df
+        # can carry None in an object-dtype M_lim column.
         M_lim = getattr(r, "M_lim", np.nan)
-        lim.append(float(M_lim) if np.isfinite(M_lim) else None)
-        keep.append(True)
+        M_lim = np.nan if M_lim is None else float(M_lim)
+        lim.append(M_lim if np.isfinite(M_lim) else None)
+
+        keep.append(i)          # the ROW that produced this column
 
     if not cols:
         return None, None, None, rows.iloc[:0]
     G = pd.concat(cols, axis=1).dropna()
-    return G.to_numpy(), np.asarray(sig), lim, rows.iloc[:len(cols)]
+    # `rows.iloc[keep]`, NOT `rows.iloc[:len(cols)]`.  Skipping one epoch shifts
+    # every later row, so slicing the head pairs column j with a different
+    # epoch than the one that built it -- feeding combined_score_marginalised
+    # the wrong p-value and labelling it with the wrong time and band.
+    return (G.to_numpy(), np.asarray(sig), lim,
+            rows.iloc[keep].reset_index(drop=True))
 
 
 def _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng, sigma_score=None):
@@ -999,6 +1208,13 @@ def estimate_rho(
 ):
     """Mean inter-epoch correlation of the normal scores, measured on the grid at
     THIS candidate's cadence.
+
+    This is the ``rho`` that ``binned_stats_cumulative_ptail(rho=...)``
+    and ``stouffer_combine(rho=...)`` need in order to apply **Strube's
+    method** (Strube 1985) instead of assuming independent epochs.
+    Without it the combined score is overconfident by a known direction:
+    at the grid-measured rho of 0.284, uncorrected Stouffer lands at KS
+    0.1111 against U(0,1) where Strube reaches 0.0065.
 
     Implements COMBINING_REPLACEMENT.md section 3 -- the grid is the null, so the
     correlation to feed ``binned_stats_cumulative_ptail(rho=...)`` is read off
@@ -1051,6 +1267,12 @@ def estimate_rho(
         NaN if fewer than two epochs are scoreable.
     """
     rng = np.random.default_rng(random_state)
+    if sigma_col is not None and sigma_col not in metric_df.columns:
+        logger.warning(
+            "estimate_rho: sigma_col=%r is not a column of metric_df; "
+            "falling back to observed_mag_err.", sigma_col,
+        )
+        sigma_col = None
     G, sig, lim, rows = _epoch_grid(metric_df, data_sim, time_bin_width, sigma_col)
     if G is None or G.shape[1] < 2 or G.shape[0] < 10:
         return (float("nan"), None) if return_matrix else float("nan")
@@ -1117,6 +1339,13 @@ def combined_score_marginalised(
     """
     rng = np.random.default_rng(random_state)
     col = sigma_col if sigma_col in metric_df.columns else None
+    if col is None:
+        logger.warning(
+            "combined_score_marginalised: sigma_col=%r is not a column of "
+            "metric_df; falling back to observed_mag_err.  If metric_df was NOT "
+            "produced with the photometric-only sigma, the null this calibrates "
+            "against is the wrong one.", sigma_col,
+        )
     G, sig, lim, rows = _epoch_grid(metric_df, data_sim, time_bin_width, col)
     if G is None or G.shape[1] < 1:
         return pd.DataFrame(columns=["obs_time", "band", "z", "z_cumsum",
@@ -1172,6 +1401,7 @@ def kilonovascorer_v3(
     M_lim_col: str = "limiting_absolute_magnitude",
     min_n_eff: float = 20.0,
     p_tail_method: str = "closed_form",
+    p_tail_std_method: str = "grid",
     n_obs: int = 100,
     random_state: Optional[int] = None,
     abc_compute: bool = True,
@@ -1370,7 +1600,11 @@ def kilonovascorer_v3(
         Per-band overlap chain summary.
     """
     # Validate once, up front, rather than on every observation.
-    p_tail_method = _resolve_p_tail_method(p_tail_method)
+    if p_tail_method not in P_TAIL_METHODS:
+        raise ValueError(
+            "p_tail_method must be one of %r; got %r."
+            % (P_TAIL_METHODS, p_tail_method)
+        )
 
     results: List[Dict[str, Any]] = []
     overlap_summary_by_band: Dict[str, Any] = {}
@@ -1546,6 +1780,7 @@ def kilonovascorer_v3(
                 M_lim=M_lim_row,
                 min_n_eff=min_n_eff,
                 p_tail_method=p_tail_method,
+                    p_tail_std_method=p_tail_std_method,
                 random_state=random_state,
             )
 
@@ -1591,9 +1826,24 @@ def kilonovascorer_v3(
                 "time_bin_high": bin_high,
                 "observed_mag": M_obs,
                 "observed_mag_err": sigma_obs,
+                # F_hat is the ONLY field carrying the DIRECTION of the
+                # deviation.  P_tail = 2*min(F, 1-F) folds the two sides
+                # together, so from P_tail alone a candidate that is too bright
+                # and one that is too faint are indistinguishable.
+                #
+                # Mind the sign.  F_hat = Pr(M_rep <= M_obs), and magnitudes run
+                # backwards, so it is the probability that a MODEL IS BRIGHTER
+                # THAN THE OBSERVATION:
+                #     F -> 0   the observation is BRIGHTER than the grid
+                #     F ~ 0.5  the observation sits mid-population
+                #     F -> 1   the observation is FAINTER than the grid
+                "F_hat": metric["F_hat"],
                 "p_tail_KNe": metric["p_tail_KNe"],
                 "p_tail_mean": metric["p_tail_mean"],
                 "p_tail_std": metric["p_tail_std"],
+                "p_tail_se_grid": metric["p_tail_se_grid"],
+                "p_tail_std_sens": metric["p_tail_std_sens"],
+                "p_tail_mean_sens": metric["p_tail_mean_sens"],
                 "p_near_KNe": metric["p_near_KNe"],
                 "M_lim": float(M_lim_row) if M_lim_row is not None else np.nan,
                 "n_eff": metric["n_eff"],
