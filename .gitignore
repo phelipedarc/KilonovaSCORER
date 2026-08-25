@@ -5,3 +5,9 @@ build/
 *.egg-info/
 .venv/
 .DS_Store
+trove_tests/
+docs/
+kn-scorer-env/
+sim-env/
+sim/
+Data/

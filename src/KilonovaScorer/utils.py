@@ -16,9 +16,105 @@ import logging
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from typing import List, Optional
+
+from scipy.special import expit, logit, ndtr, ndtri
 
 logger = logging.getLogger(__name__)
+
+P_TAIL_STD_FLOOR = None
+
+
+# ---------------------------------------------------------------------------
+# Flux-space conversions and non-detection scoring
+# ---------------------------------------------------------------------------
+
+def flux_of(M, zp=0.0):
+    """Absolute magnitude -> flux: ``F = 10**(-0.4*(M - zp))``. Monotone
+    decreasing, so brighter = larger F, opposite of magnitude. ``zp`` cancels
+    out of every probability computed from F; it only keeps values near
+    order-unity."""
+    return 10.0 ** (-0.4 * (np.asarray(M, dtype=float) - zp))
+
+
+def flux_sigma_of(M, sigma_mag, zp=0.0):
+    """Delta-method flux uncertainty from a magnitude uncertainty:
+    ``sigma_F = F * ln(10)/2.5 * sigma_mag``. Only valid for a real detection
+    -- a non-detection has no magnitude to propagate from, see
+    :func:`flux_sigma_of_limit`."""
+    F = flux_of(M, zp)
+    return F * (np.log(10.0) / 2.5) * np.asarray(sigma_mag, dtype=float)
+
+
+def flux_sigma_of_limit(M_lim, n_sigma=5.0, zp=0.0):
+    """Flux uncertainty implied by a quoted N-sigma non-detection depth:
+    ``sigma_F = flux_of(m_lim) / n_sigma``."""
+    return flux_of(M_lim, zp) / float(n_sigma)
+
+
+def _flux_score_axis(M, zp=0.0):
+    """Negated flux, for internal use by the scorer only.
+
+    The P_tail machinery assumes smaller = brighter (true of magnitude,
+    false of flux). Feeding it raw flux would flip the sign of F_hat and
+    invert the M_lim detectability weight's direction. Negating both m and
+    M_lim restores the magnitude-like convention; F_hat/P_tail/p_tail_mean/
+    P_near are all invariant to a simultaneous sign flip, so nothing else
+    needs to change.
+    """
+    return -flux_of(M, zp)
+
+
+def nondetection_tail(sim_values, M_lim, n_sigma_limit=5.0, flux_zp=0.0):
+    """P_tail for a non-detection -- a different test from P_tail_KNe, not
+    the same machinery fed an imputed measurement.
+
+    A non-detection is censored ("flux below threshold"), not a point
+    measurement at zero -- treating it as one saturates the ordinary PIT
+    (real fluxes sit many sigma above zero, so every simulation's term
+    collapses to 1 regardless of brightness; see
+    ``sim/flux_space_validate.py``). Instead this uses the standard
+    censored-data likelihood for an upper limit::
+
+        P_detect = mean_sim( Phi((F_sim - F_thresh) / sigma_phot) )
+        p_tail   = 1 - P_detect
+
+    No two-sided fold: the observed outcome (non-detection) is fixed, so
+    this is a one-sided p-value, not a PIT.
+
+    Parameters
+    ----------
+    sim_values : array-like
+        Simulated absolute magnitudes for the relevant time bin.
+    M_lim : float
+        This observation's own quoted limiting absolute magnitude.
+    n_sigma_limit : float
+        Significance the depth was quoted at.
+    flux_zp : float
+        Flux zeropoint; cancels out of every probability.
+
+    Returns
+    -------
+    dict with ``F_hat`` (= P_detect), ``p_tail_KNe``, ``p_tail_mean``
+    (identical -- no jitter average here), ``p_tail_std`` (NaN),
+    ``p_near_KNe`` (NaN), ``n_eff``, ``scoreable`` (always True),
+    ``p_tail_method`` (``"nondetection"``).
+    """
+    F_sim = flux_of(np.asarray(sim_values, dtype=float), flux_zp)
+    F_thresh = flux_of(M_lim, flux_zp)
+    sigma_phot = flux_sigma_of_limit(M_lim, n_sigma_limit, flux_zp)
+    P_detect = float(ndtr((F_sim - F_thresh) / sigma_phot).mean())
+    p_tail = 1.0 - P_detect
+    return {
+        "F_hat": P_detect,
+        "p_tail_KNe": p_tail,
+        "p_tail_mean": p_tail,
+        "p_tail_std": float("nan"),
+        "p_near_KNe": float("nan"),
+        "n_eff": float(np.asarray(sim_values).size),
+        "scoreable": True,
+        "p_tail_method": "nondetection",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +127,7 @@ def compute_abs_mag_samples(
     dist_mpc: float,
     dist_err_mpc: float,
     n_samples: int = 5000,
+    return_components: bool = False,
 ):
     """
     Convert apparent magnitude(s) to absolute magnitude via Monte Carlo sampling.
@@ -56,6 +153,9 @@ def compute_abs_mag_samples(
         Uncertainty on the luminosity distance in Mpc.
     n_samples : int
         Number of Monte Carlo draws per observation.
+    return_components : bool
+        Also return the two terms the total is built from.  ``False`` (default)
+        preserves the original two-value return exactly.
 
     Returns
     -------
@@ -63,13 +163,13 @@ def compute_abs_mag_samples(
         Mean absolute magnitude(s).  np.nan for invalid inputs.
     abs_mag_std : float or np.ndarray
         Standard deviation of absolute magnitude(s).  np.nan for invalid inputs.
-
-    Notes
-    -----
-    When called with arrays, one independent set of ``n_samples`` distance
-    draws is shared across all rows (same distance realisation), while
-    apparent-magnitude noise is drawn independently per row.  This correctly
-    reflects that the distance uncertainty is a global systematic.
+    abs_mag_std_phot : float or np.ndarray
+        Returned only when ``return_components``.  The PHOTOMETRIC term alone,
+        i.e. ``app_mag_err``: independent per observation.
+    sigma_mu : float
+        Returned only when ``return_components``.  The distance-modulus
+        uncertainty: ONE number for the whole candidate, identical at every
+        epoch.
     """
     scalar_input = np.ndim(app_mag) == 0
 
@@ -85,12 +185,20 @@ def compute_abs_mag_samples(
     abs_mag_std  = np.full(n_obs, np.nan)
 
     # Global distance validation
+    def _out(mean, std, phot, sig_mu):
+        if scalar_input:
+            mean, std = float(mean[0]), float(std[0])
+            phot = float(phot[0])
+        if return_components:
+            return mean, std, phot, float(sig_mu)
+        return mean, std
+
+    abs_mag_std_phot = np.where(np.isfinite(app_mag), app_mag_err, np.nan)
+
     if not np.isfinite(dist_mpc) or dist_mpc <= 0:
         logger.warning("Invalid distance dist_mpc=%.3f — returning NaN.", dist_mpc)
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
-    # Sample distance modulus (shared across all observations — distance is a
-    # global systematic, not an independent draw per row)
     D_samples = np.random.normal(dist_mpc, dist_err_mpc, n_samples) * 1e6  # parsecs
     D_samples = D_samples[D_samples > 0]
 
@@ -100,10 +208,11 @@ def compute_abs_mag_samples(
             "dist_err_mpc=%.3f.  Returning NaN.",
             dist_mpc, dist_err_mpc,
         )
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
     n_valid = len(D_samples)
     mu_samples = 5.0 * np.log10(D_samples) - 5.0  # shape (n_valid,)
+    sigma_mu = float(np.std(mu_samples))
 
     for i in range(n_obs):
         if not np.isfinite(app_mag[i]):
@@ -116,16 +225,18 @@ def compute_abs_mag_samples(
         abs_mag_mean[i] = np.mean(abs_samples)
         abs_mag_std[i]  = np.std(abs_samples)
 
-    if scalar_input:
-        return float(abs_mag_mean[0]), float(abs_mag_std[0])
-    return abs_mag_mean, abs_mag_std
+    return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, sigma_mu)
 
 
 # ---------------------------------------------------------------------------
 # Logit-space inverse-variance weighted aggregation
 # ---------------------------------------------------------------------------
 
-def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
+def ivw_stats_logit(
+    group: pd.DataFrame,
+    eps: float = 1e-4,
+    s_floor: float = None,
+) -> pd.Series:
     """
     Inverse-variance weighted mean and uncertainty in logit space.
 
@@ -148,7 +259,16 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
         ``p_tail_mean`` and ``p_tail_std`` columns.
     eps : float
         Clamping value to keep scores away from 0 and 1 before logit
-        transform (prevents infinite logit values).
+        transform (prevents infinite logit values).  Rows with
+        ``p_tail_mean == 0`` are kept and clamped to ``eps``; they are not
+        filtered out, because a categorically-rejected epoch carries the
+        strongest evidence in the bin.
+    s_floor : float or None
+        Lower bound applied to ``p_tail_std`` before the delta method, so that
+        an epoch with zero spread gets a large but finite weight instead of a
+        division by zero.  ``None`` falls back to :data:`P_TAIL_STD_FLOOR`, and
+        thence to ``eps``.  This is a scientific lever, not a numerical
+        detail — see the constant.
 
     Returns
     -------
@@ -156,26 +276,30 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
         ``mean``  – inverse-variance weighted mean (probability space).
         ``std``   – propagated uncertainty (probability space).
         ``count`` – number of valid scores used.
-    """
-    #Handling the zero scores:
-    # inside ivw_stats_logit, before computing weights:
-    valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
-    group = group[valid]
-    if group.empty:
-        return pd.Series({"mean": 0.0, "std": 0.0})
-      
-    p = group["p_tail_mean"].to_numpy()
-    s = group["p_tail_std"].to_numpy()
 
-    mask = np.isfinite(p) & np.isfinite(s) & (s > 0)
+        All return paths carry all three keys.  The previous early return
+        emitted only ``{mean, std}``, which under ``groupby(...).apply(...)``
+        produced ``count = NaN`` — and the bare ``.dropna()`` in
+        ``binned_stats_cumulative_ptail`` then deleted the entire bin on the
+        strength of that missing field alone.
+    """
+    p = group["p_tail_mean"].to_numpy(dtype=float)
+    s = group["p_tail_std"].to_numpy(dtype=float)
+
+    mask = np.isfinite(p) & np.isfinite(s) & (s >= 0.0)
     p, s = p[mask], s[mask]
 
     if len(p) == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
+    # Floor s == 0 rather than dropping it
+    floor = s_floor if s_floor is not None else P_TAIL_STD_FLOOR
+    if floor is None:
+        floor = eps
     p_clipped = np.clip(p, eps, 1.0 - eps)
+    s_floored = np.maximum(s, floor)
     z     = logit(p_clipped)
-    z_std = s / (p_clipped * (1.0 - p_clipped))    # delta method
+    z_std = s_floored / (p_clipped * (1.0 - p_clipped))    # delta method
     weights = 1.0 / z_std ** 2
 
     z_mean     = np.sum(weights * z) / np.sum(weights)
@@ -186,6 +310,146 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
 
     return pd.Series({"mean": mean, "std": std, "count": len(p)})
 
+def stouffer_combine(
+    p,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Combine p-values by the weighted Stouffer method, with Strube's
+    correlation correction.
+
+    ``rho = 0`` is Stouffer (1949); ``rho > 0`` is **Strube's method** (Strube
+    1985, *Psychological Bulletin* 97, 334-341), the generalisation of Stouffer
+    to non-independent tests.  Both are the same function because they differ
+    only in the normaliser -- see ``rho`` below.  The name stays
+    ``stouffer_combine`` because that is what it is at the default, and because
+    a correlation argument on Stouffer is the standard interface (R's ``poolr``
+    spells it ``stouffer(..., adjust=)``).
+
+    Returns
+    -------
+    dict with keys ``p_combined``, ``Z``, ``count``.
+        ``p_combined`` is itself a p-value on (0, 1) — small means inconsistent
+        with the kilonova hypothesis, the same orientation as ``P_tail``.
+    """
+    p = np.asarray(p, dtype=float)
+    p = p[np.isfinite(p)]
+
+    n = p.size
+    if n == 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": 0}
+
+    p_clipped = np.clip(p, eps, 1.0 - eps)
+    z = ndtri(1.0 - p_clipped)          # uniform in -> standard normal out
+
+    num = float(np.sum(z))
+    # Strube 1985 eq. for equal weights: Var(sum z) = n + rho*n*(n-1).
+    var = float(n) + float(rho) * float(n) * float(n - 1)
+    if not np.isfinite(var) or var <= 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": int(n)}
+
+    Z = num / np.sqrt(var)
+    return {
+        "p_combined": float(ndtr(-Z)),   # 1 - Phi(Z), computed stably
+        "Z": float(Z),
+        "count": int(n),
+    }
+
+
+def stouffer_stats(
+    group: pd.DataFrame,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+) -> pd.Series:
+    """
+    Per-time-bin Stouffer combination, shaped as a drop-in for
+    :func:`ivw_stats_logit`.
+
+    Parameters
+    ----------
+    group : pd.DataFrame
+        Subset of the metrics DataFrame for a single time bin.  Must contain
+        ``p_tail_mean``.  ``p_tail_std`` is neither required nor read — that is
+        the point of the change.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+
+    Returns
+    -------
+    pd.Series
+        ``mean``  – the combined p-value for this bin.
+        ``std``   – standard error of the epoch spread about the mean, i.e. how
+                    much the epochs in this bin disagree.  This is NOT a
+                    propagated measurement error and is 0.0 for a single epoch;
+                    nothing downstream weights by it.
+        ``count`` – number of epochs combined.
+
+        All return paths carry all three keys, so ``groupby(...).apply(...)``
+        cannot introduce a spurious NaN column for ``dropna`` to act on.
+    """
+    p = group["p_tail_mean"].to_numpy(dtype=float)
+    res = stouffer_combine(p, eps=eps, rho=rho)
+    if res["count"] == 0:
+        return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
+
+    finite = p[np.isfinite(p)]
+    spread = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+              if finite.size > 1 else 0.0)
+    return pd.Series({
+        "mean": res["p_combined"],
+        "std": spread,
+        "count": res["count"],
+    })
+
+
+def calculate_sequential_score_stouffer(
+    p_by_bin,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Cumulative score after each time bin, by Stouffer combination.
+
+    The running score at bin ``k`` combines every epoch from bins ``0..k``
+    directly from their per-epoch p-values, rather than re-combining
+    already-combined bin scores.  Combining p-values is associative only if the
+    inputs stay uniform, and a combined p-value is uniform but no longer
+    independent of its own components, so going back to the raw epochs is both
+    simpler and exactly calibrated at every ``k``.
+
+    Parameters
+    ----------
+    p_by_bin : sequence of array-like
+        Per-epoch p-values, grouped by time bin, in chronological order.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+
+    Returns
+    -------
+    running_score : np.ndarray
+        Cumulative combined p-value after each bin.
+    running_err : np.ndarray
+        Standard error of the epoch spread accumulated so far.  Reported for
+        schema compatibility; it is a dispersion, not a propagated error, and
+        nothing consumes it as a weight.
+    """
+    n = len(p_by_bin)
+    running_score = np.full(n, np.nan)
+    running_err = np.full(n, np.nan)
+
+    acc_p: List[float] = []
+    for i in range(n):
+        acc_p.extend(np.asarray(p_by_bin[i], dtype=float).ravel().tolist())
+        res = stouffer_combine(acc_p, eps=eps, rho=rho)
+        running_score[i] = res["p_combined"]
+
+        finite = np.asarray(acc_p, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        running_err[i] = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+                          if finite.size > 1 else 0.0)
+
+    return running_score, running_err
 
 # ---------------------------------------------------------------------------
 # Sequential logit-space cumulative score update
@@ -226,32 +490,45 @@ def calculate_sequential_score_logit(
     running_error : np.ndarray
         Propagated uncertainty on the cumulative score (probability space).
     """
+    means = np.asarray(means, dtype=float)
+    stds  = np.asarray(stds, dtype=float)
+
     n = len(means)
-    running_score = np.zeros(n)
-    running_error = np.zeros(n)
+    running_score = np.full(n, np.nan)
+    running_error = np.full(n, np.nan)
+
+    if n == 0:
+        return running_score, running_error
 
     means_clipped = np.clip(means, eps, 1.0 - eps)
     z     = logit(means_clipped)
     z_std = stds / (means_clipped * (1.0 - means_clipped))  # delta method
 
-    # Initialise from first bin
-    current_z    = z[0]
-    current_prec = 1.0 / z_std[0] ** 2
-    running_score[0] = float(means_clipped[0])
-    running_error[0] = float(stds[0])
+    valid = np.isfinite(z) & np.isfinite(z_std) & (z_std > 0.0)
 
-    for i in range(1, n):
-        if not np.isfinite(z[i]) or not np.isfinite(z_std[i]):
+    first = int(np.argmax(valid)) if valid.any() else -1
+    if first < 0:
+        # No usable bin.  Return all-NaN rather than indexing z[0], which used
+        # to raise IndexError on an empty frame.
+        return running_score, running_error
+
+    current_z = z[first]
+    current_prec = 1.0 / z_std[first] ** 2
+    running_score[first] = float(means_clipped[first])
+    running_error[first] = float(stds[first])
+
+    for i in range(first + 1, n):
+        if not valid[i]:
             # Carry forward without update
             running_score[i] = running_score[i - 1]
             running_error[i] = running_error[i - 1]
             continue
 
-        new_prec     = 1.0 / z_std[i] ** 2
+        new_prec = 1.0 / z_std[i] ** 2
         updated_prec = current_prec + new_prec
-        updated_z    = (current_z * current_prec + z[i] * new_prec) / updated_prec
+        updated_z = (current_z * current_prec + z[i] * new_prec) / updated_prec
 
-        current_z    = updated_z
+        current_z = updated_z
         current_prec = updated_prec
 
         score_i = float(expit(updated_z))
@@ -259,9 +536,6 @@ def calculate_sequential_score_logit(
         running_error[i] = score_i * (1.0 - score_i) * np.sqrt(1.0 / updated_prec)
 
     return running_score, running_error
-
-
-
 
 def timer_warp(func):
     @wraps(func)

@@ -1,14 +1,3 @@
-"""
-core.py — KilonovaScorer core pipeline.
-
-Implements:
-  - JSON / CSV photometry loading with absolute magnitude computation
-  - LSST-like cadence downsampling
-  - P_tail_KNe and P_near_KNe scoring via noise-convolved KDE (predictive_tail_kde)
-  - ABC sequential survival diagnostic (overlap_chain)
-  - Logit-space inverse-variance weighted cumulative scoring
-"""
-
 # ---------------------------------------------------------------------------
 # Standard library
 # ---------------------------------------------------------------------------
@@ -23,25 +12,72 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
+from scipy.special import ndtr, ndtri
 from scipy.stats import gaussian_kde
 
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------
-from .utils import *  # noqa: F401,F403  (decorators and helpers)
+from .utils import * 
+from .utils import _flux_score_axis 
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "P_TAIL_METHODS",
+    "SPACE_METHODS",
+    "DEFAULT_RANDOM_STATE",
+    "flux_of",
+    "flux_sigma_of",
+    "flux_sigma_of_limit",
+    "nondetection_tail",
+    "arcade_progress_bar",
+    "parse_json_photometry",
+    "load_observations",
+    "preprocess_lsst_like",
+    "predictive_tail_kde",
+    "compute_consistent_ids_anyhit",
+    "overlap_chain",
+    "binned_stats_cumulative_ptail",
+    "kilonovascorer_v3",
+    "compute_abs_mag_samples",
+    "ivw_stats_logit",
+    "stouffer_combine",
+    "stouffer_stats",
+    "calculate_sequential_score_stouffer",
+    "calculate_sequential_score_logit",
+    "timer_warp",
+    "time_plot",
+]
 
 # ---------------------------------------------------------------------------
 # Progress bar
 # ---------------------------------------------------------------------------
 
+#: Set once the stream is found unable to encode the block characters, so the
+#: encoding is probed once rather than once per observation.
+# TODO: Is this really necessary?
+_ASCII_BAR = False
+
 def arcade_progress_bar(current: int, total: int, bar_length: int = 30) -> None:
-    """Print an arcade-style progress bar to stdout."""
+    "Print an arcade-style progress bar to stdout."
+    global _ASCII_BAR
     percent = current / total
     filled = int(bar_length * percent)
-    bar = "█" * filled + "-" * (bar_length - filled)
-    sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}% ⬛")
+
+    if not _ASCII_BAR:
+        bar = "█" * filled + "-" * (bar_length - filled)
+        try:
+            sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}% ⬛")
+            sys.stdout.flush()
+            if current == total:
+                sys.stdout.write("\n")
+            return
+        except UnicodeEncodeError:
+            _ASCII_BAR = True
+
+    bar = "#" * filled + "-" * (bar_length - filled)
+    sys.stdout.write(f"\r[ {bar} ] {percent * 100:6.2f}%")
     sys.stdout.flush()
     if current == total:
         sys.stdout.write("\n")
@@ -162,14 +198,17 @@ def load_observations(
 
     # Vectorised absolute-magnitude computation — compute_abs_mag_samples must
     # accept 1-D arrays and return (abs_mag_array, abs_err_array).
-    abs_mag, abs_err = compute_abs_mag_samples(  # noqa: F821 (from utils.*)
+    abs_mag, abs_err, abs_err_phot, sigma_mu = compute_abs_mag_samples(  # noqa: F821
         df["magnitude"].to_numpy(),
         df["e_magnitude"].to_numpy(),
         dist_mpc=dist_mpc,
         dist_err_mpc=dist_err_mpc,
+        return_components=True,
     )
     df["absolute_magnitude"] = abs_mag
     df["absolute_magnitude_error"] = abs_err
+    df["absolute_magnitude_error_phot"] = abs_err_phot
+    df["distance_modulus_error"] = sigma_mu
 
     return df
 
@@ -243,18 +282,26 @@ def preprocess_lsst_like(
 # Core scoring: P_tail_KNe and P_near_KNe
 # ---------------------------------------------------------------------------
 
+P_TAIL_METHODS = ("closed_form", "montecarlo")
+SPACE_METHODS = ("magnitude", "flux")
+DEFAULT_RANDOM_STATE = 0
+
 def predictive_tail_kde(
     sim_values: np.ndarray,
     M_obs: float,
     sigma_obs: float,
     k: float = 1.5,
     n_sim: int = 50000,
-    n_obs: int = 100,
+    n_obs: int = 400,
     kde: Optional[gaussian_kde] = None,
+    p_tail_method: str = "closed_form",
+    sigma_model: float = 0.0,
+    random_state: Optional[int] = DEFAULT_RANDOM_STATE,
+    p_near_compute: bool = True,
 ) -> Dict[str, float]:
     """
     Compute P_tail_KNe and P_near_KNe from the noise-convolved prior predictive
-    distribution (PPD) via KDE.
+    distribution (PPD).
 
     Implements the two-sided tail-area probability (paper eq. 2)::
 
@@ -265,19 +312,15 @@ def predictive_tail_kde(
 
         P_near_KNe = Pr(M_rep in [M_obs - k*sigma_obs, M_obs + k*sigma_obs])
 
-    Both are evaluated on the noise-convolved PPD:
-        Y = X* + epsilon,  X* ~ KDE(sim_values),  epsilon ~ N(0, sigma_obs)
-
-    Uncertainty on P_tail_KNe is propagated by sampling N_obs realisations of
-    M_obs from N(M_obs, sigma_obs), as described in the paper.  The broadcast
-    comparison (N_obs, 1) vs (n_sim,) -> (N_obs, n_sim) is fully vectorised.
-
-    P_near_KNe is a *local*, per-observation score and is intentionally not
-    aggregated across bands or epochs (paper Section 2).  Only P_tail_KNe
-    (via p_tail_mean / p_tail_std) feeds into the cumulative logit-space score.
-
-    A pre-fitted KDE can be supplied via ``kde`` to avoid redundant fitting when
-    multiple observations share the same simulation time bin.
+    TWO ESTIMATORS, SELECTED BY ``p_tail_method``
+    ---------------------------------------------
+    Neither is removed; the default changed.  They do NOT target quite the same
+    integral, and the difference is not negligible: the closed form integrates
+    against the EMPIRICAL grid, while ``montecarlo`` integrates against a
+    KDE-SMOOTHED version of it, so the Monte Carlo reference is wider by the
+    kernel bandwidth h. Feeding the closed form
+    ``sqrt(sigma_obs^2 + h^2)`` reproduces the Monte Carlo result to within its
+    own Monte Carlo error.
 
     Parameters
     ----------
@@ -290,59 +333,172 @@ def predictive_tail_kde(
     k : float
         ROPE half-width factor.  Paper fiducial value: 1.5.
     n_sim : int
-        Number of Monte Carlo draws for the noise-convolved PPD.
+        Number of Monte Carlo draws for the noise-convolved PPD.  Used only when
+        ``p_tail_method="montecarlo"``; ignored by the closed form, which is
+        exact.
     n_obs : int
-        Number of M_obs realisations for P_tail_KNe uncertainty estimation.
-        Paper value: N_obs = 100.
+        Number of M_obs realisations for the P_tail_KNe uncertainty estimate.
+        Paper value: N_obs = 100; default here raised to 400 to halve the
+        sampling noise on ``p_tail_mean``/``p_tail_std`` at sub-linear extra
+        cost.  Used by BOTH estimators -- the jitter loop lives inside the
+        ``closed_form`` branch too, not only ``montecarlo``.
     kde : gaussian_kde or None
-        Pre-fitted KDE object.  If None, a new KDE is fitted to ``sim_values``.
+        Pre-fitted KDE, to avoid redundant fitting when several observations
+        share a simulation time bin.  Used only when
+        ``p_tail_method="montecarlo"``; the closed form needs no fitted KDE.
+    p_tail_method : {"closed_form", "montecarlo"}
+        Estimator, as above.  Exactly one of ``P_TAIL_METHODS``; anything else
+        raises.
+    random_state : int or None
+        Seed for the ``n_obs`` jitter draws, used by BOTH estimators -- the
+        closed form is exact in the integral it evaluates, but still draws
+        ``n_obs`` jittered realisations of ``M_obs`` to report
+        ``p_tail_mean``/``p_tail_std``, so it is not deterministic unless
+        seeded.  Defaults to ``DEFAULT_RANDOM_STATE`` (0) so the function is
+        deterministic out of the box, matching its documented behaviour; pass
+        ``None`` explicitly to opt back into NumPy's global random state (the
+        original behaviour, useful for deliberately averaging over many
+        independent realisations).
+    sigma_model : float
+        Model-inadequacy allowance in magnitudes, added IN QUADRATURE to
+        ``sigma_obs`` when convolving the reference: ``sqrt(sigma_obs^2 +
+        sigma_model^2)``.  It enters ONCE, here.  It is a statement about how
+        far the model family is trusted -- a property of the MODELS, not of the
+        telescope, which is why it is additive rather than a multiple of
+        ``sigma_obs``: one ``k`` would grant a different allowance to every
+        object.  ``0.0`` (default) reproduces previous behaviour exactly.
+        ``docs/SIGMA_MODEL.md`` measures ~0.70 mag on the local grid, chosen by
+        calibration drift on held-out kilonovae rather than by the AUC peak.
+
+        It does NOT widen the detection weight, the ROPE, or the measurement
+        jitter -- those are properties of the observation and keep ``sigma_obs``.
+    p_near_compute : bool
+        If True (default), compute P_near_KNe.  If False the ROPE evaluation is
+        skipped entirely and ``p_near_KNe`` comes back NaN.  P_near_KNe is a
+        purely diagnostic, per-observation quantity that never feeds the
+        cumulative score, so disabling it cannot affect P_tail_KNe.
+
 
     Returns
     -------
     dict with keys:
-        F_hat        – empirical CDF F(M_obs) under the noise-convolved PPD.
-        p_tail_KNe   – two-sided tail probability at M_obs (point estimate).
-        p_tail_mean  – mean P_tail_KNe over n_obs M_obs uncertainty samples.
-        p_tail_std   – std  P_tail_KNe over n_obs M_obs uncertainty samples.
-        p_near_KNe   – ROPE-based local consistency score P_near_KNe.
+        F_hat        - CDF F(M_obs) under the noise-convolved PPD; exact under
+                       the closed form, empirical under Monte Carlo.
+        p_tail_KNe   - two-sided tail probability at the POINT measurement
+                       (paper eq. 7).  Reported for reference; not scored.
+        p_tail_mean  - THE SCORED QUANTITY (paper eq. 8): mean of P_tail over
+                       ``n_obs`` realisations of M_obs jittered by sigma_obs.
+                       Lower than p_tail_KNe for epochs near the population
+                       median, because the two-sided fold is concave there.
+        p_tail_std   - sd of P_tail over those same realisations.  Free from
+                       the samples already drawn.  Read only by
+                       ``method="ivw"``; the Stouffer/Strube default reads no
+                       per-epoch uncertainty.
+        p_near_KNe   - ROPE-based local consistency score P_near_KNe, or
+                       NaN when ``p_near_compute`` is False.
+        scoreable    - False when ``M_obs`` is non-finite; the p_tail keys
+                       are NaN.
+        p_tail_method- the estimator actually used, normalised.
 
     Raises
     ------
     ValueError
-        If ``sim_values`` is empty or ``sigma_obs`` is non-positive.
+        If ``sim_values`` is empty, ``sigma_obs`` is non-positive, or
+        ``p_tail_method`` is not recognised.
     """
     sim_values = np.asarray(sim_values)
     if sim_values.size == 0:
         raise ValueError("sim_values cannot be empty.")
-    if sigma_obs <= 0:
-        raise ValueError("sigma_obs must be positive.")
 
-    # 1. Build noise-convolved PPD: Y = X* + epsilon, X* ~ KDE, epsilon ~ N(0, sigma_obs)
-    if kde is None:
-        kde = gaussian_kde(sim_values)
-    x_star = kde.resample(n_sim)[0]
-    y_dist = x_star + np.random.normal(0, sigma_obs, size=n_sim)
+    if not (sigma_obs > 0):
+        raise ValueError(
+            "sigma_obs must be positive and finite; got %r." % (sigma_obs,)
+        )
 
-    # 2. P_tail_KNe — two-sided tail probability at M_obs (paper eq. 2)
-    F_hat = float(np.mean(y_dist <= M_obs))
-    p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
+    if p_tail_method not in P_TAIL_METHODS:
+        raise ValueError(
+            "p_tail_method must be one of %r; got %r."
+            % (P_TAIL_METHODS, p_tail_method)
+        )
 
-    # 3. P_near_KNe — fraction of noise-convolved PPD draws within the ROPE
-    #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
-    p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
+    if not np.isfinite(sigma_model) or sigma_model < 0.0:
+        raise ValueError(
+            "sigma_model must be finite and non-negative; got %r."
+            % (sigma_model,)
+        )
 
-    # 4. P_tail_KNe uncertainty — sample N_obs realisations of M_obs (paper Section 2)
-    #    Broadcast: (n_obs, 1) vs (n_sim,) -> (n_obs, n_sim)
-    M_obs_samples = np.random.normal(M_obs, sigma_obs, n_obs)
-    F_hat_samples = (y_dist <= M_obs_samples[:, np.newaxis]).mean(axis=1)
-    p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
+    if not np.isfinite(M_obs):
+        return {
+            "F_hat": float("nan"),
+            "p_tail_KNe": float("nan"),
+            "p_tail_mean": float("nan"),
+            "p_tail_std": float("nan"),
+            "p_near_KNe": float("nan"),
+            "scoreable": False,
+            "p_tail_method": p_tail_method,
+        }
+
+    m = np.asarray(sim_values, dtype=float)
+
+    s_obs = float(sigma_obs)
+    # Variances add in quadrature of observational and model error
+    s = float(np.hypot(s_obs, float(sigma_model)))
+
+    if p_tail_method == "closed_form":
+        # Each simulated m_i treated as a gaussian and error function used for CDF
+        phi = ndtr((M_obs - m) / s)
+        F_hat = float(phi.mean())
+
+        p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
+
+        rng_j = (np.random if random_state is None
+                 else np.random.default_rng(random_state))
+
+        x_j = M_obs + rng_j.normal(0.0, s_obs, int(n_obs))
+        phi_j = ndtr((x_j[:, None] - m[None, :]) / s)
+        F_j = phi_j.mean(axis=1)
+        p_j = 2.0 * np.minimum(F_j, 1.0 - F_j)
+        p_tail_mean = float(p_j.mean())
+        p_tail_std = float(p_j.std())
+
+        p_near_KNe = float("nan")
+        if p_near_compute:
+            half = k * s_obs
+            p_near_KNe = float(
+                (ndtr((M_obs + half - m) / s)
+                 - ndtr((M_obs - half - m) / s)).mean()
+            )
+
+    else:
+        # Making it deterministic
+        rng = np.random if random_state is None else np.random.default_rng(random_state)
+
+        if kde is None:
+            kde = gaussian_kde(m)
+        n_draw = int(n_sim)
+        x_star = kde.resample(n_draw, seed=random_state)[0]
+        y_dist = x_star + rng.normal(0.0, s, size=n_draw)
+
+        F_hat = float(np.mean(y_dist <= M_obs))
+        p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
+
+        p_near_KNe = (float(np.mean(np.abs(y_dist - M_obs) <= k * s))
+                      if p_near_compute else float("nan"))
+
+        M_obs_samples = rng.normal(M_obs, s_obs, size=int(n_obs))
+        F_hat_samples = (y_dist <= M_obs_samples[:, np.newaxis]).mean(axis=1)
+        p_tail_samples = 2.0 * np.minimum(F_hat_samples, 1.0 - F_hat_samples)
+        p_tail_mean = float(np.mean(p_tail_samples))
+        p_tail_std = float(np.std(p_tail_samples))
 
     return {
         "F_hat": F_hat,
         "p_tail_KNe": p_tail_KNe,
-        "p_tail_mean": float(np.mean(p_tail_samples)),
-        "p_tail_std": float(np.std(p_tail_samples)),
+        "p_tail_mean": p_tail_mean,
+        "p_tail_std": p_tail_std,
         "p_near_KNe": p_near_KNe,
+        "scoreable": True,
+        "p_tail_method": p_tail_method,
     }
 
 
@@ -356,6 +512,8 @@ def compute_consistent_ids_anyhit(
     M_obs: float,
     sigma_obs: float,
     overlap_k: float = 2.0,
+    sim_bin: Optional[pd.DataFrame] = None,
+    count_only: bool = False,
 ) -> List:
     """
     Return simulation IDs whose predicted magnitude falls within the ROPE at
@@ -377,24 +535,69 @@ def compute_consistent_ids_anyhit(
         Observational uncertainty.
     overlap_k : float
         ROPE half-width multiplier (sigma units).
+    sim_bin : pd.DataFrame or None
+        The rows of ``sim_band`` already restricted to ``bin_idx``.  Supply it
+        when the caller has it: ``sim_band`` holds every time bin for the band,
+        so selecting on ``time_bin == bin_idx`` here rescans the whole band on
+        every observation -- 200,000 rows to reach 10,000 of them, once per epoch
+        -- and then takes two columns out of the result.  ``kilonovascorer_v3``
+        already builds exactly this frame to score against and now passes it
+        through, which measured 2.4x on the diagnostic at a 10,000-sample grid
+        and 1.7x at 25,000.  ``None`` (default) keeps the original
+        self-contained behaviour, so existing callers are unaffected.
+    count_only : bool
+        Return ``len(ids)`` instead of the id list, skipping the unique/tolist
+        materialisation.  Used by ``abc_return_ids=False``.
 
     Returns
     -------
     list
-        Unique sample IDs consistent with the ROPE at this epoch.
+        Unique sample IDs consistent with the ROPE at this epoch.  An ``int``
+        count instead when ``count_only`` is set.
     """
-    sim_bin = sim_band.loc[
-        sim_band["time_bin"] == bin_idx, ["sample_id", "absolute_magnitude"]
-    ]
+    if sim_bin is None:
+        sim_bin = sim_band.loc[
+            sim_band["time_bin"] == bin_idx, ["sample_id", "absolute_magnitude"]
+        ]
     if sim_bin.empty:
-        return []
+        return 0 if count_only else []
+
+    return _anyhit_from_arrays(
+        sim_bin["absolute_magnitude"].to_numpy(),
+        sim_bin["sample_id"].to_numpy(),
+        M_obs, sigma_obs, overlap_k, count_only,
+    )
+
+
+def _anyhit_from_arrays(
+    mag: np.ndarray,
+    sid: np.ndarray,
+    M_obs: float,
+    sigma_obs: float,
+    overlap_k: float = 2.0,
+    count_only: bool = False,
+):
+    """The ROPE any-hit test itself, on two aligned arrays.
+
+    Shared by both partition paths so that the DataFrame form and the array-view
+    form cannot drift apart: whichever way the rows were selected, this is the
+    code that decides which simulations are consistent.
+    """
+    if mag.size == 0:
+        return 0 if count_only else []
 
     rope_half_width = overlap_k * sigma_obs
-    inside = np.abs(sim_bin["absolute_magnitude"].to_numpy() - M_obs) <= rope_half_width
-    return sim_bin.loc[inside, "sample_id"].dropna().unique().tolist()
+    inside = np.abs(mag - M_obs) <= rope_half_width
+    ids = sid[inside]
+    ids = pd.unique(ids[pd.notna(ids)])
+    return len(ids) if count_only else ids.tolist()
 
 
-def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
+def overlap_chain(
+    ids_lists: List[List],
+    times: List[float],
+    return_ids: bool = True,
+) -> Dict[str, Any]:
     """
     Compute the sequential ABC survival diagnostic across observations.
 
@@ -412,6 +615,12 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
         Per-observation lists of consistent simulation IDs.
     times : list of float
         Observation timestamps (days after merger), same order as ids_lists.
+    return_ids : bool
+        Include the id lists in the result.  ``True`` (default) is the original
+        behaviour.  ``False`` reports every COUNT and leaves the lists empty,
+        which skips a ``sorted()`` over the survivor set at every epoch and, more
+        importantly, stops the caller materialising them into DataFrame cells --
+        one candidate at a 10,000-sample grid otherwise carries ~320,000 ids.
 
     Returns
     -------
@@ -437,10 +646,11 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
 
     # Initialise running intersection from first observation
     survivors = sets[0].copy()
+    _ids = (lambda s: sorted(s)) if return_ids else (lambda s: [])
     survivors_over_time = [{
         "t": float(times_sorted[0]),
         "n_survivors": len(survivors),
-        "survivor_ids": sorted(survivors),
+        "survivor_ids": _ids(survivors),
     }]
 
     pairwise = []
@@ -451,7 +661,7 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
             "t_left": float(times_sorted[i]),
             "t_right": float(times_sorted[i + 1]),
             "n_overlap": len(inter),
-            "overlap_ids": sorted(inter),
+            "overlap_ids": _ids(inter),
         })
 
         # Cumulative: S_t = S_{t-1} ∩ S_t
@@ -459,14 +669,14 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
         survivors_over_time.append({
             "t": float(times_sorted[i + 1]),
             "n_survivors": len(survivors),
-            "survivor_ids": sorted(survivors),
+            "survivor_ids": _ids(survivors),
         })
 
     return {
         "times": times_sorted.tolist(),
         "pairwise": pairwise,
         "survivors_over_time": survivors_over_time,
-        "final_survivors": sorted(survivors),
+        "final_survivors": _ids(survivors),
         "final_n_survivors": len(survivors),
     }
 
@@ -478,27 +688,64 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
 def binned_stats_cumulative_ptail(
     metric_df: pd.DataFrame,
     bin_size: float = 0.2,
+    method: str = "stouffer",
+    rho: float = 0.0,
 ) -> pd.DataFrame:
     """
     Aggregate per-observation P_tail_KNe scores into time-binned cumulative scores.
 
-    Within each time bin, individual scores are combined using an
-    inverse-variance weighted mean in logit space (see paper Section 2).
-    The result is then updated sequentially across bins to produce a running
-    cumulative score, also in logit space.
+    Scores are combined within each time bin, then updated sequentially across
+    bins to produce a running cumulative score.  BOTH COMBINERS ARE AVAILABLE;
+    the default changed from ``"ivw"`` to ``"stouffer"``.
 
-    Logit-space aggregation prevents extreme scores with small absolute
-    uncertainties from dominating the weighted mean — a known pathology of
-    direct probability-space averaging near the [0, 1] boundaries.
+    ``method="stouffer"`` (default).  Each epoch's P_tail is treated as what it
+    is under the null — a p-value, uniform on (0, 1) — and combined as a
+    standardised SUM of normal scores, ``Z = sum(z) / sqrt(n + rho*n*(n-1))``
+    with ``z = Phi^-1(1 - p)``.  Z is exactly standard normal under the null,
+    so the combined score is a calibrated p-value.
+
+    EQUAL WEIGHTS, and the option to pass others is gone rather than merely
+    defaulted off.  Two reasons, one empirical and one structural.  The power
+    test (``trove_tests/docs/WEIGHTS.md``) found no ancillary scheme that beat
+    equal weighting beyond noise, nor did the provably-optimal oracle weight.
+    And Strube's normaliser needs the FULL correlation matrix once the weights
+    are unequal: the scalar rho is exact only under exchangeability, which
+    equal weights preserve and unequal weights break.  Weighted Stouffer with
+    a scalar rho is therefore miscalibrated by an unknown amount, which is a
+    bad trade for a power gain measured at zero.
+
+    ``method="ivw"``.  The ORIGINAL combiner: inverse-variance weighted mean in
+    logit space, weights ``1/sigma_z^2`` from ``p_tail_std`` via the delta method
+    (paper Section 2).  Logit-space aggregation prevents extreme scores with
+    small absolute uncertainties from dominating the weighted mean — a known
+    pathology of direct probability-space averaging near the [0, 1] boundaries.
+    Retained so that results published against it remain reproducible; see the
+    notes above ``stouffer_combine`` in utils.py for why it is no longer the
+    default.
+
+    Brown's method (moment-matched scaled chi-square) was implemented and
+    measured head to head, then REMOVED because it is not being used.  It won on
+    power and lost on robustness -- ~7x more swayed by a single bad epoch -- and
+    with ``rho=0`` it degenerates exactly to Fisher.  The full comparison is
+    kept in REPORT.md section 16.6.
 
     Parameters
     ----------
     metric_df : pd.DataFrame
-        Output of ``kilonovascorer``.  Must contain ``obs_time``,
-        ``p_tail_mean``, and ``p_tail_std`` columns.
+        Output of ``kilonovascorer``.  Must contain ``obs_time`` and
+        ``p_tail_mean``; ``p_tail_std`` is required only by ``method="ivw"``.
     bin_size : float
         Width of time bins in days.  Should match the scorer's
         ``time_bin_width`` (default 0.2 d).
+    method : {"stouffer", "ivw"}
+        Combiner, as above.
+    rho : float
+        Mean inter-epoch correlation of the normal scores.  ``0.0`` (default)
+        assumes independence and gives plain Stouffer; a positive value applies
+        **Strube's method** (Strube 1985), the correlation-corrected Stouffer --
+        see ``stouffer_combine`` in utils.py for the formula and the measured
+        calibration.  Ignored by ``method="ivw"``, which has no correlation
+        correction available at all.
 
     Returns
     -------
@@ -509,6 +756,9 @@ def binned_stats_cumulative_ptail(
     """
   #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
   #modidy back to +  bin_size
+    if method not in ("stouffer", "ivw"):
+        raise ValueError("method must be 'stouffer' or 'ivw'.")
+
     bin_edges = np.arange(
         metric_df["obs_time"].min() - bin_size / 2,
         metric_df["obs_time"].max() + bin_size ,
@@ -517,27 +767,80 @@ def binned_stats_cumulative_ptail(
     metric_df = metric_df.copy()
     metric_df["time_bin"] = pd.cut(metric_df["obs_time"], bins=bin_edges)
 
+    if method == "ivw":
+        # Retained for comparison and backwards compatibility only.  See the
+        # notes above stouffer_combine in utils.py for why it is not the default.
+        binned_stats = (
+            metric_df.groupby("time_bin", observed=True)
+            .apply(ivw_stats_logit)  # noqa: F821 (from utils.*)
+            .reset_index()
+        )
+        binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
+        # Same narrowing as the stouffer path below, and this is the path it
+        # was written for: a bare .dropna() deletes a bin if ANY column is NaN,
+        # which is how all-zero bins used to vanish before ivw_stats_logit
+        # returned `count` on every path.  (origin/trove, `zero-epochs-handling`)
+        binned_stats = binned_stats.dropna(subset=["mean", "std"])
+
+        if binned_stats.empty:
+            binned_stats["running_mean"] = []
+            binned_stats["running_std"] = []
+            return binned_stats
+
+        running_mean, running_err = calculate_sequential_score_logit(
+            binned_stats["mean"].values,
+            binned_stats["std"].values,
+        )
+        binned_stats["running_mean"] = running_mean
+        binned_stats["running_std"] = running_err
+        return binned_stats
+
+    # p-value combination.  Per-bin first, then a cumulative combination that
+    # goes back to the raw per-epoch p-values rather than re-combining bin
+    # scores.
     binned_stats = (
         metric_df.groupby("time_bin", observed=True)
-        .apply(ivw_stats_logit)  # noqa: F821 (from utils.*)
+        .apply(lambda g: stouffer_stats(g, rho=rho))
         .reset_index()
     )
     binned_stats["time_mid"] = binned_stats["time_bin"].apply(lambda x: x.mid)
-    binned_stats = binned_stats.dropna()
+    # Narrowed from a bare .dropna(): with how="any" a single NaN in ANY
+    # column deleted the whole bin.  That is how all-zero bins used to vanish —
+    # ivw_stats_logit's old two-key early return left count = NaN under
+    # groupby.apply, and the bin was dropped on the strength of that missing
+    # field alone, never because its score was unusable.  Restricting the
+    # subset to the two columns the running score actually consumes means a
+    # future schema addition cannot silently start deleting bins again.
+    binned_stats = binned_stats.dropna(subset=["mean", "std"])
 
-    running_mean, running_err = calculate_sequential_score_logit(  # noqa: F821
-        binned_stats["mean"].values,
-        binned_stats["std"].values,
+
+    if binned_stats.empty:
+        binned_stats["running_mean"] = []
+        binned_stats["running_std"] = []
+        return binned_stats
+
+    # Chronological order, and the raw epochs behind each surviving bin.
+    binned_stats = binned_stats.sort_values("time_mid").reset_index(drop=True)
+    by_bin = {k: v for k, v in metric_df.groupby("time_bin", observed=True)}
+    p_by_bin = [by_bin[tb]["p_tail_mean"].to_numpy(dtype=float)
+                for tb in binned_stats["time_bin"]]
+
+    running_mean, running_err = calculate_sequential_score_stouffer(  # noqa: F821
+        p_by_bin, rho=rho,
     )
     binned_stats["running_mean"] = running_mean
     binned_stats["running_std"] = running_err
 
     return binned_stats
 
-
 # ---------------------------------------------------------------------------
 # Main scorer
 # ---------------------------------------------------------------------------
+
+#: Returned for a bin that holds no simulations, so that the per-observation
+#: branch always yields arrays and never None.
+_EMPTY_F = np.empty(0, dtype=float)
+
 
 def kilonovascorer_v3(
     data_obs: pd.DataFrame,
@@ -549,6 +852,23 @@ def kilonovascorer_v3(
     n_kde_sim: int = 50000,
     min_sim_points: int = 20,
     overlap_k: float = 2.0,
+    p_tail_method: str = "closed_form",
+    sigma_model: float = 0.0,
+    n_obs: int = 400,
+    random_state: Optional[int] = DEFAULT_RANDOM_STATE,
+    abc_compute: bool = True,
+    abc_return_ids: bool = True,
+    sigma_col: Optional[str] = None,
+    band_split: bool = True,
+    abc_reuse_bin: bool = True,
+    array_bins: bool = True,
+    p_near_compute: bool = True,
+    space: str = "magnitude",
+    score_limits: bool = False,
+    is_limit_col: str = "is_limit",
+    n_sigma_limit: float = 5.0,
+    flux_zp: float = 0.0,
+    nondetection_gate: float = 0.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -557,7 +877,8 @@ def kilonovascorer_v3(
 
     - **P_tail_KNe** — two-sided tail probability of M_obs under the
       noise-convolved PPD (with uncertainty via observation sampling).
-    - **P_near_KNe** — ROPE-based local consistency score.
+    - **P_near_KNe** — ROPE-based local consistency score (optional; see
+      ``p_near_compute``).
     - **ABC survival diagnostic** — sequential intersection of consistent
       simulation IDs across epochs (|S_t| from paper Section 3).
 
@@ -579,31 +900,233 @@ def kilonovascorer_v3(
     k_near : float
         ROPE half-width factor for P_near_KNe (paper fiducial: 1.5).
     n_kde_sim : int
-        Monte Carlo samples for the noise-convolved KDE.
+        Number of Monte Carlo draws for the noise-convolved PPD.  Used only
+        when ``p_tail_method="montecarlo"``; the closed form is exact and
+        ignores it.
     min_sim_points : int
         Minimum number of simulations required in a bin to attempt scoring.
     overlap_k : float
         ROPE half-width factor for the ABC diagnostic (sigma units).
+    p_tail_method : {"closed_form", "montecarlo"}
+        Which estimator computes P_tail_KNe and P_near_KNe.
+
+        ``"closed_form"`` (default) evaluates both as exact sums of error
+        functions over the simulations in the bin: deterministic, ~20x faster,
+        and it applies ``sigma_obs`` once.
+
+        ``"montecarlo"`` restores the ORIGINAL estimator exactly — fit a
+        Gaussian KDE per time bin, resample it ``n_kde_sim`` times, add
+        observational noise, and count — including its ``p_tail_std``, taken
+        as the spread of P_tail over ``n_obs`` jittered realisations of M_obs.
+        Choose it to reproduce results published before the change, or to
+        compare the two on the same photometry.  It is stochastic unless
+        ``random_state`` is set, and it applies ``sigma_obs`` twice.
+
+        See :func:`predictive_tail_kde` for the full comparison.
+    n_obs : int
+        Number of M_obs realisations behind ``p_tail_mean`` and
+        ``p_tail_std``.  Paper value: 100; default here raised to 400 to
+        halve the sampling noise at sub-linear extra cost.  Used by BOTH
+        estimators, not only ``p_tail_method="montecarlo"``.
+    random_state : int or None
+        Seed for the ``n_obs`` jitter draws, used by BOTH estimators.
+        Defaults to ``DEFAULT_RANDOM_STATE`` (0) so the score is
+        deterministic out of the box; pass ``None`` explicitly to opt back
+        into NumPy's global random state (the original, non-deterministic
+        behaviour).
+    abc_compute : bool
+        Compute the ABC survival diagnostic.  ``True`` (default) preserves the
+        existing output.  ``False`` skips it and leaves the ABC columns empty.
+        Measured on warm runs at a 10,000-sample grid the diagnostic is 16% of
+        the run and at 25,000 samples 10% -- worth having off when only the
+        P_tail score is wanted, but not the dominant cost.  (An earlier note here
+        claimed 50%; that came from timing the with-ABC arm as a cold first call
+        against a warm without-ABC arm, and is withdrawn.)
+    abc_return_ids : bool
+        Include the per-epoch simulation id lists (``consistent_ids``,
+        ``overlap_with_next_ids``, ``running_survivors_ids``).  ``True``
+        (default) preserves the existing output.  ``False`` keeps every COUNT and
+        empties the lists.
+
+        This does NOT speed up an in-memory run -- the chain still needs the sets
+        to intersect, so only the per-epoch ``sorted()`` is saved, and the
+        measured difference is within noise.  Its purpose is OUTPUT SIZE: one
+        candidate at a 10,000-sample grid otherwise materialises ~320,000 ids
+        into 40 DataFrame cells, which most callers immediately reduce back to a
+        length, and which dominate the cost of writing the metrics table.
+    sigma_col : str or None
+        Column of ``data_obs`` to use as the per-epoch uncertainty instead of
+        ``absolute_magnitude_error``.  ``None`` (default) is the existing
+        behaviour.
+
+        The reason this exists is ``sigma_col="absolute_magnitude_error_phot"``.
+        ``absolute_magnitude_error`` is the correct MARGINAL uncertainty --
+        photometry and distance in quadrature -- so each P_tail computed from it
+        is a calibrated per-epoch p-value.  But the distance term is ONE draw
+        shared by every epoch (97.7% of the variance on AT2017gfo), and feeding
+        it in per epoch hides that from the combiner, which then treats strongly
+        correlated epochs as independent.
+
+        Used ON ITS OWN this column is NOT a calibrated p-value: it understates
+        the per-epoch uncertainty by design, and the combined statistic must then
+        be calibrated against a null that puts the systematic back.  See
+        REPORT.md Part X.
+
+    band_split : bool
+        Partition ``data_sim`` and ``data_obs`` by filter ONCE with a groupby
+        (``True``, default) instead of re-scanning the full table per band with
+        ``data_sim["filter_mapped"] == band``.  On an object-dtype string column
+        that comparison is an elementwise Python-string test over every row, run
+        once per band, and it was the single largest line in the profile --
+        larger than the ABC diagnostic and an order of magnitude larger than
+        ``predictive_tail_kde``.  Measured 2.0x at a 10,000-sample grid and 1.9x
+        at 25,000.
+
+        ``False`` restores the original per-band comparison.  The two select the
+        same rows in the same order, so this is a speed switch only; it exists to
+        make that claim checkable rather than asserted.
+
+    abc_reuse_bin : bool
+        Hand the already-selected time-bin slice to the ABC diagnostic
+        (``True``, default) instead of letting it re-select the slice for itself.
+        ``kilonovascorer_v3`` groups the band by ``time_bin`` up front and holds
+        the current bin in order to score against it;
+        ``compute_consistent_ids_anyhit`` was then rebuilding exactly those rows
+        with a boolean mask over the WHOLE band, once per observation -- 200,000
+        rows scanned to reach 10,000 of them at a 10,000-sample grid.  The waste
+        is a factor of the number of time bins.  Measured 3.3x on the diagnostic
+        at 25,000 samples.
+
+        ``False`` restores the re-selection, which is the code the diagnostic
+        still runs whenever it is called directly without ``sim_bin=``.  The ROPE
+        test, the any-hit rule and the returned ids are untouched either way, so
+        the two agree exactly.
+
+    array_bins : bool
+        Partition each band's grid into per-bin ARRAY VIEWS (``True``, default)
+        rather than into a DataFrame per bin.  ``sim_band.groupby("time_bin")``
+        materialises one small DataFrame per bin -- 80 of them for four bands and
+        twenty bins -- and every use site then immediately calls ``.to_numpy()``
+        on two of their columns.  A stable argsort on the bin codes plus
+        ``np.diff`` gives the same partition as slice boundaries, and a slice of
+        a numpy array is a view: no take, no copy, no DataFrame.  After the other
+        two optimisations this was 72% of the run and the top three entries in
+        the profile; measured 2.3x on the partition.
+
+        ``False`` restores the groupby.  Equivalence rests on ``groupby``
+        preserving within-group row order and ``np.argsort(kind="stable")`` doing
+        the same, so group k and slice k hold the same rows in the same ORDER --
+        which is what makes the ABC id lists match element for element and not
+        merely as sets.
+
+        The ROPE test is shared: both paths call ``_anyhit_from_arrays`` on the
+        same two arrays, so they cannot drift apart.  With
+        ``abc_reuse_bin=False`` the diagnostic re-selects from ``sim_band``
+        exactly as before, under either partition.
+
+    All three flags are speed switches with no effect on any output.  Turning
+    them off reproduces the pre-optimisation scorer::
+
+        kilonovascorer_v3(..., band_split=False, abc_reuse_bin=False,
+                          array_bins=False)
+    p_near_compute : bool
+        If True (default), compute P_near_KNe for each observation.  If False,
+        the ROPE evaluation is skipped and the ``p_near_KNe`` column is filled
+        with NaN.  P_near_KNe is a per-observation diagnostic that is never
+        aggregated, so disabling it leaves P_tail_KNe, the cumulative score and
+        the ABC diagnostics unchanged.
+    space : {"magnitude", "flux"}
+        Space a real DETECTION is compared in.  ``"magnitude"`` (default)
+        is unchanged from before this option existed.  ``"flux"`` runs the
+        same P_tail machinery on exponentiated values instead -- a
+        legitimate but numerically DIFFERENT test, not interchangeable with
+        magnitude-space scores for the same epoch.
+    score_limits : bool
+        If True, rows flagged by ``is_limit_col`` are scored via
+        ``nondetection_tail`` instead of being dropped.  Default False
+        reproduces every prior result unchanged.  See ``nondetection_gate``
+        below for how a limit's score is allowed to affect combining.
+    is_limit_col : str
+        Column flagging a non-detection row.  Its ``absolute_magnitude`` is
+        read as that row's own quoted limiting magnitude.
+    n_sigma_limit : float
+        Significance the quoted depth was reported at (paper-specific --
+        get it from the source, don't guess).
+    flux_zp : float
+        Flux zeropoint; cancels out of every probability, kept only to keep
+        numbers near order-unity.
+    nondetection_gate : float
+        A non-detection's ``p_tail_mean`` only enters combining
+        (Stouffer/Strube or IVW) when its ``F_hat`` (= P_detect, the
+        model's own detection probability) is at least this value;
+        otherwise it is excluded (NaN), the same as being dropped. One that
+        does pass is additionally capped at ``min(p_tail_mean, 0.5)``. Both
+        exist for the same reason: Stouffer maps ``p_tail_mean -> 1`` to
+        strong evidence FOR the model, but most non-detections are simply
+        uninformative, so an uncapped, ungated non-detection can inflate a
+        candidate's score toward 1 regardless of what its detections say.
+        The gate excludes epochs that carry no information at all; the cap
+        ensures the ones that remain can only argue tension (push the score
+        down), never confirmation. Default 0.5 is a starting point, not a
+        swept value -- see ``docs/FLUX_SPACE.md``.
 
     Returns
     -------
     results_df : pd.DataFrame
-        Per-observation metrics including P_tail_KNe, P_near_KNe, and ABC
-        diagnostics.
+        Per-observation metrics including P_tail_KNe, P_near_KNe (NaN when
+        ``p_near_compute`` is False), and ABC diagnostics.
     summary_df : pd.DataFrame
         Per-band overlap chain summary.
     """
+    if p_tail_method not in P_TAIL_METHODS:
+        raise ValueError(
+            "p_tail_method must be one of %r; got %r."
+            % (P_TAIL_METHODS, p_tail_method)
+        )
+    if space not in SPACE_METHODS:
+        raise ValueError(
+            "space must be one of %r; got %r." % (SPACE_METHODS, space)
+        )
+    if not (np.isfinite(n_sigma_limit) and n_sigma_limit > 0):
+        raise ValueError(
+            "n_sigma_limit must be finite and positive; got %r." % (n_sigma_limit,)
+        )
+    if not (np.isfinite(nondetection_gate) and 0.0 <= nondetection_gate <= 1.0):
+        raise ValueError(
+            "nondetection_gate must be in [0, 1]; got %r." % (nondetection_gate,)
+        )
+
     results: List[Dict[str, Any]] = []
     overlap_summary_by_band: Dict[str, Any] = {}
 
+    # No functional change, just speed-up with .groupby()
+    sim_by_band: Optional[Dict[Any, pd.DataFrame]] = None
+    obs_by_band: Optional[Dict[Any, pd.DataFrame]] = None
+    if band_split:
+        sim_by_band = {k: v for k, v in data_sim.groupby("filter_mapped", observed=True)}
+        obs_by_band = {k: v for k, v in data_obs.groupby("filter_mapped", observed=True)}
+
     for band in band_list:
         # 1. Filter data for this band
-        sim_band = data_sim[data_sim["filter_mapped"] == band].copy()
-        obs_band = data_obs[data_obs["filter_mapped"] == band].copy()
+        if band_split:
+            sim_band = sim_by_band.get(band)
+            obs_band = obs_by_band.get(band)
+            if sim_band is None or obs_band is None:
+                logger.debug("No data for band %s — skipping.", band)
+                continue
+        else:
+            # The original: one elementwise comparison over the whole table.
+            sim_band = data_sim[data_sim["filter_mapped"] == band]
+            obs_band = data_obs[data_obs["filter_mapped"] == band]
 
         if sim_band.empty or obs_band.empty:
             logger.debug("No data for band %s — skipping.", band)
             continue
+
+        _needs_bin_col = not (array_bins and abc_reuse_bin)
+        if _needs_bin_col:
+            sim_band = sim_band.copy()
+        obs_band = obs_band.copy()
 
         # 2. Assign simulation time bins (computed once per band).
         #    Bin edges are chosen so that the first and last observations both
@@ -621,19 +1144,41 @@ def kilonovascorer_v3(
         # assert bins[0] < t_first < bins[1],  "First observation not centred in first bin."
         # assert bins[-2] < t_last < bins[-1], "Last observation not centred in last bin."
 
-        sim_band["time_bin"] = np.digitize(sim_band["time"], bins)
+        _bin_codes = np.digitize(sim_band["time"].to_numpy(), bins)
+        if _needs_bin_col:
+            sim_band["time_bin"] = _bin_codes
 
-        # Pre-group simulations by time bin for O(1) lookup per observation
-        sim_groups: Dict[int, pd.DataFrame] = {
-            k: v for k, v in sim_band.groupby("time_bin")
-        }
+        # Pre-partition simulations by time bin for O(1) lookup per observation.
+        sim_groups: Optional[Dict[int, pd.DataFrame]] = None
+        sim_arrays: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None
+        if array_bins:
+            # A stable sort on the bin codes puts each bin's rows in one
+            # contiguous run, IN THEIR ORIGINAL ORDER, so the runs are exactly
+            # groupby's groups.  np.diff finds the run boundaries; the slices
+            # are views, not copies.
+            _tb = _bin_codes
+            _order = np.argsort(_tb, kind="stable")
+            _tb_sorted = _tb[_order]
+            _mag = sim_band["absolute_magnitude"].to_numpy()[_order]
+            _sid = sim_band["sample_id"].to_numpy()[_order]
+            _cuts = np.flatnonzero(np.diff(_tb_sorted)) + 1
+            _starts = np.concatenate(([0], _cuts))
+            _stops = np.concatenate((_cuts, [_tb_sorted.size]))
+            sim_arrays = {
+                int(_tb_sorted[a]): (_mag[a:b], _sid[a:b])
+                for a, b in zip(_starts, _stops)
+            }
+        else:
+            sim_groups = {k: v for k, v in sim_band.groupby("time_bin")}
 
         # Per-band tracking for ABC overlap chain
         band_times: List[float] = []
         band_ids_lists: List[List] = []
         band_row_indices: List[int] = []
 
-        # KDE cache: fitted once per bin_idx, reused across observations in the same bin
+        # KDE cache: fitted once per bin_idx and reused across the observations
+        # sharing that bin.  Only the Monte Carlo estimator needs it; the closed
+        # form never fits a KDE, so the cache stays empty and costs nothing.
         kde_cache: Dict[int, gaussian_kde] = {}
 
         # 3. Process observations in chronological order
@@ -645,49 +1190,141 @@ def kilonovascorer_v3(
             M_obs = float(obs_row.absolute_magnitude)
             sigma_obs = float(obs_row.absolute_magnitude_error)
 
-            # Skip degenerate observations
-            if not (np.isfinite(M_obs) and np.isfinite(sigma_obs) and sigma_obs > 0):
+            # Non-detections score via nondetection_tail regardless of
+            # `space` (which only picks how detections are compared).
+            is_limit_row = (score_limits
+                            and bool(getattr(obs_row, is_limit_col, False)))
+            if is_limit_row:
+                sigma_obs = float("nan")   # nothing to propagate for a limit
+
+            # The per-epoch uncertainty actually scored with.  Normally the
+            # column as given; `sigma_col` overrides it, which is how the
+            # photometric-only path of Part X is selected.
+            if sigma_col is not None and not is_limit_row:
+                s_row = getattr(obs_row, sigma_col, None)
+                if s_row is not None and np.isfinite(s_row) and s_row > 0:
+                    sigma_obs = float(s_row)
+
+            # Skip degenerate observations.  A limit row supplies its depth
+            # through M_obs and needs no sigma_obs of its own -- see below.
+            if is_limit_row:
+                if not np.isfinite(M_obs):
+                    logger.debug("Skipping limit with no quoted depth at "
+                                "t=%.3f d.", t_obs)
+                    continue
+            elif not (np.isfinite(M_obs) and np.isfinite(sigma_obs)
+                     and sigma_obs > 0):
                 logger.debug("Skipping invalid observation at t=%.3f d.", t_obs)
                 continue
 
             bin_idx = int(np.digitize(t_obs, bins))
-            sim_bin = sim_groups.get(bin_idx, pd.DataFrame())
+            # One branch, yielding the same three things either way: how many
+            # simulations the bin holds, their magnitudes, and their ids.
+            if array_bins:
+                mag_bin, sid_bin = sim_arrays.get(bin_idx, (_EMPTY_F, _EMPTY_F))
+                sim_bin = None
+                n_bin = int(mag_bin.size)
+            else:
+                sim_bin = sim_groups.get(bin_idx, pd.DataFrame())
+                n_bin = len(sim_bin)
+                mag_bin = (sim_bin["absolute_magnitude"].to_numpy()
+                           if n_bin else _EMPTY_F)
+                sid_bin = sim_bin["sample_id"].to_numpy() if n_bin else _EMPTY_F
 
-            if len(sim_bin) < min_sim_points:
+            if n_bin < min_sim_points:
                 logger.debug(
                     "Bin %d has %d simulations (< %d) — skipping.",
-                    bin_idx, len(sim_bin), min_sim_points,
+                    bin_idx, n_bin, min_sim_points,
                 )
                 continue
 
-            # 3a. Fit KDE once per bin; reuse if another observation shares the same bin
-            if bin_idx not in kde_cache:
-                kde_cache[bin_idx] = gaussian_kde(
-                    sim_bin["absolute_magnitude"].to_numpy()
+            # 3a. Compute P_tail_KNe and P_near_KNe (paper eqs. 6-7 and 4).
+            #     Non-detections use nondetection_tail (censored, not a
+            #     point measurement); detections use the one PIT-based
+            #     estimator regardless of space, since it only needs
+            #     converted inputs.
+            if is_limit_row:
+                metric = nondetection_tail(
+                    mag_bin, M_lim=M_obs,
+                    n_sigma_limit=n_sigma_limit, flux_zp=flux_zp,
                 )
-            cached_kde = kde_cache[bin_idx]
+                # Stouffer maps p_tail_mean -> 1 to strong evidence FOR the
+                # model, but most non-detections are simply uninformative
+                # (nothing was expected to be seen). Gate: exclude those
+                # entirely rather than let them count as confirmation. Cap:
+                # even an informative one can only say "tension" (z >= 0),
+                # never "confirms" (z < 0) -- see docs/FLUX_SPACE.md.
+                metric["p_tail_nondetect_raw"] = metric["p_tail_mean"]
+                if metric["F_hat"] < nondetection_gate:
+                    metric["p_tail_KNe"] = float("nan")
+                    metric["p_tail_mean"] = float("nan")
+                else:
+                    metric["p_tail_KNe"] = min(metric["p_tail_KNe"], 0.5)
+                    metric["p_tail_mean"] = min(metric["p_tail_mean"], 0.5)
+            else:
+                score_bin, score_M_obs, score_sigma_obs = mag_bin, M_obs, sigma_obs
+                if space == "flux":
+                    score_bin = _flux_score_axis(mag_bin, flux_zp)
+                    score_M_obs = float(_flux_score_axis(M_obs, flux_zp))
+                    score_sigma_obs = float(
+                        flux_sigma_of(M_obs, sigma_obs, flux_zp))
 
-            # 3b. Compute P_tail_KNe and P_near_KNe (paper eqs. 2 and 4)
-            metric = predictive_tail_kde(
-                sim_bin["absolute_magnitude"].to_numpy(),
-                M_obs=M_obs,
-                sigma_obs=sigma_obs,
-                k=k_near,
-                n_sim=n_kde_sim,
-                n_obs=100,      # N_obs = 100 per paper Section 2
-                kde=cached_kde,
-            )
+                #     Under the closed form these are exact sums over the
+                #     simulations in the bin, so there is no KDE to fit;
+                #     under Monte Carlo one is fitted per bin and reused.
+                cached_kde = None
+                if p_tail_method == "montecarlo":
+                    if bin_idx not in kde_cache:
+                        kde_cache[bin_idx] = gaussian_kde(score_bin)
+                    cached_kde = kde_cache[bin_idx]
 
-            # 3c. ABC diagnostic — consistent simulation IDs at this epoch
-            consistent_ids = compute_consistent_ids_anyhit(
-                sim_band=sim_band,
-                bin_idx=bin_idx,
-                M_obs=M_obs,
-                sigma_obs=sigma_obs,
-                overlap_k=overlap_k,
-            )
+                metric = predictive_tail_kde(
+                    score_bin,
+                    M_obs=score_M_obs,
+                    sigma_obs=score_sigma_obs,
+                    k=k_near,
+                    n_sim=n_kde_sim,
+                    n_obs=n_obs,
+                    kde=cached_kde,
+                    p_tail_method=p_tail_method,
+                    sigma_model=sigma_model,
+                    random_state=random_state,
+                    p_near_compute=p_near_compute,
+                )
 
-            # 3d. Safe time-bin edge lookup
+            # 3b. ABC diagnostic — consistent simulation IDs at this epoch.
+            #     `sim_bin` is passed through when abc_reuse_bin: it is exactly
+            #     the rows compute_consistent_ids_anyhit would otherwise select
+            #     for itself, and the scorer already holds it.  Without it the
+            #     function rescans the whole band once per observation -- 200,000
+            #     rows to reach 10,000 of them at a 10,000-sample grid, a waste
+            #     of a factor of the number of time bins -- which measured 3.3x
+            #     of the diagnostic's cost at 25,000 samples.
+            #
+            #     Passing None goes back to the old path
+            consistent_ids: List = []
+            # ABC's ROPE test is defined in magnitude space; a limit row has
+            # no magnitude-space sigma_obs to give it (that is the whole
+            # reason it needed flux space to score at all), so it is skipped
+            # for that row rather than fed a manufactured number.
+            if abc_compute and not is_limit_row:
+                if abc_reuse_bin and array_bins:
+                    # The rows are already in hand as two arrays; go straight to
+                    # the shared ROPE test.
+                    consistent_ids = _anyhit_from_arrays(
+                        mag_bin, sid_bin, M_obs, sigma_obs, overlap_k,
+                    )
+                else:
+                    consistent_ids = compute_consistent_ids_anyhit(
+                        sim_band=sim_band,
+                        bin_idx=bin_idx,
+                        M_obs=M_obs,
+                        sigma_obs=sigma_obs,
+                        overlap_k=overlap_k,
+                        sim_bin=sim_bin if abc_reuse_bin else None,
+                    )
+
+            # 3c. Safe time-bin edge lookup
             bin_low = float(bins[bin_idx - 1] if bin_idx > 0 else bins[0])
             bin_high = float(bins[bin_idx] if bin_idx < len(bins) else bins[-1])
 
@@ -699,14 +1336,19 @@ def kilonovascorer_v3(
                 "time_bin_high": bin_high,
                 "observed_mag": M_obs,
                 "observed_mag_err": sigma_obs,
+                "F_hat": metric["F_hat"],
                 "p_tail_KNe": metric["p_tail_KNe"],
                 "p_tail_mean": metric["p_tail_mean"],
                 "p_tail_std": metric["p_tail_std"],
                 "p_near_KNe": metric["p_near_KNe"],
-                "n_sim_bin": len(sim_bin),
+                "scoreable": metric["scoreable"],
+                "p_tail_method": metric["p_tail_method"],
+                "space": space,
+                "is_limit": bool(is_limit_row),
+                "p_tail_nondetect_raw": metric.get("p_tail_nondetect_raw", np.nan),
+                "n_sim_bin": n_bin,
                 "n_consistent_lcs": len(consistent_ids),
-                "consistent_ids": consistent_ids,
-                # ABC overlap fields — populated in post-processing step 4
+                "consistent_ids": consistent_ids if abc_return_ids else [],
                 "overlap_with_next_n": np.nan,
                 "overlap_with_next_ids": [],
                 "running_survivors_n": np.nan,
@@ -714,14 +1356,16 @@ def kilonovascorer_v3(
             }
 
             results.append(row)
-            band_times.append(t_obs)
-            band_ids_lists.append(consistent_ids)
+            if abc_compute:
+                band_times.append(t_obs)
+                band_ids_lists.append(consistent_ids)
             band_row_indices.append(len(results) - 1)
             arcade_progress_bar(count, total_obs, bar_length=50)
 
         # 4. Post-processing: compute ABC overlap chain for this band
         if band_ids_lists:
-            chain = overlap_chain(band_ids_lists, band_times)
+            chain = overlap_chain(
+                band_ids_lists, band_times, return_ids=abc_return_ids)
             overlap_summary_by_band[band] = chain
 
             # Map running survivors back to per-observation rows
