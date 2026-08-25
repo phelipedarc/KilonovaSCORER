@@ -80,9 +80,7 @@ def nondetection_tail(sim_values, M_lim, n_sigma_limit=5.0, flux_zp=0.0):
         p_tail   = 1 - P_detect
 
     No two-sided fold: the observed outcome (non-detection) is fixed, so
-    this is a one-sided p-value, not a PIT. It is also a BINARY-outcome
-    p-value, so it is conservative (>= Uniform(0,1)) rather than exactly
-    uniform under the null -- expected, not a bug.
+    this is a one-sided p-value, not a PIT.
 
     Parameters
     ----------

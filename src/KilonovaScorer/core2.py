@@ -19,6 +19,13 @@ from scipy.stats import gaussian_kde
 # Internal
 # ---------------------------------------------------------------------------
 from .utils import *  # noqa: F401,F403  (decorators and helpers)
+# `import *` skips underscore-prefixed names, so the star import above does NOT
+# bring `_flux_score_axis` across even though it sits beside the other flux
+# helpers in utils.  Without this line every `space="flux"` DETECTION raises
+# `NameError` at the three call sites below, while magnitude space and
+# non-detections (which convert to flux internally) keep working -- so the
+# breakage stays invisible until someone asks for flux space.
+from .utils import _flux_score_axis  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -386,26 +393,6 @@ def predictive_tail_kde(
         purely diagnostic, per-observation quantity that never feeds the
         cumulative score, so disabling it cannot affect P_tail_KNe.
 
-    space : {"magnitude", "flux"}
-        Space a real DETECTION is compared in.  ``"magnitude"`` (default)
-        is unchanged from before this option existed.  ``"flux"`` runs the
-        same P_tail machinery on exponentiated values instead -- a
-        legitimate but numerically DIFFERENT test, not interchangeable with
-        magnitude-space scores for the same epoch.
-    score_limits : bool
-        If True, rows flagged by ``is_limit_col`` are scored via
-        ``nondetection_tail`` (always flux-based, regardless of ``space``)
-        instead of being dropped.  Default False reproduces every prior
-        result unchanged.
-    is_limit_col : str
-        Column flagging a non-detection row.  Its ``absolute_magnitude`` is
-        read as that row's own quoted limiting magnitude.
-    n_sigma_limit : float
-        Significance the quoted depth was reported at (paper-specific --
-        get it from the source, don't guess).
-    flux_zp : float
-        Flux zeropoint; cancels out of every probability, kept only to keep
-        numbers near order-unity.
 
     Returns
     -------
@@ -1045,7 +1032,9 @@ def _epoch_grid(metric_df, data_sim, time_bin_width=0.2, sigma_col=None):
             rows.iloc[keep].reset_index(drop=True))
 
 
-def _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng, sigma_score=None):
+def _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng, sigma_score=None,
+                      is_limit=None, depth=None, n_sigma_limit=5.0,
+                      nondetection_gate=0.5):
     """Draw simulated candidates from the grid, observe them, and score them.
 
     One ``delta`` per DRAW -- not per epoch -- which is the whole point: the
@@ -1056,12 +1045,69 @@ def _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng, sigma_score=None):
     idx = rng.integers(0, n_grid, n_draws)
     truth = G[idx, :]
     sig_score = sig if sigma_score is None else np.asarray(sigma_score, dtype=float)
-    eps = rng.normal(0.0, 1.0, (n_draws, n_ep)) * sig_score[None, :]
     delta = rng.normal(0.0, float(sigma_mu), (n_draws, 1)) if sigma_mu else 0.0
-    obs = truth + eps - delta
-    return np.column_stack([
-        _tail_from_grid(obs[:, j], G[:, j], sig[j], lim[j])
-        for j in range(n_ep)])
+
+    if is_limit is None:
+        eps = rng.normal(0.0, 1.0, (n_draws, n_ep)) * sig_score[None, :]
+        obs = truth + eps - delta
+        return np.column_stack([
+            _tail_from_grid(obs[:, j], G[:, j], sig[j], lim[j])
+            for j in range(n_ep)])
+
+    # Survey-realised path.  A limit epoch's score cannot be simulated the way
+    # a detection's is: `nondetection_tail` is a function of the DEPTH and the
+    # GRID alone, so redrawing the candidate leaves it unchanged and the
+    # column has zero variance -- its correlation with anything is 0/0, which
+    # is why the old path returned all-NaN for those columns and `np.nanmean`
+    # silently reduced rho to a detections-only quantity (REPORT.md Part XV
+    # section 71).
+    #
+    # Stop conditioning on the epoch type instead.  Under the null, whether a
+    # given epoch of a given simulated candidate is a detection or a
+    # non-detection is ITSELF part of the draw -- bright objects are detected
+    # at every epoch, faint ones at none -- and that indicator is what carries
+    # the correlation.  So threshold each draw the way the survey did.
+    is_limit = np.asarray(is_limit, dtype=bool)
+    depth = np.asarray(depth, dtype=float)
+    truth_mu = truth - delta          # distance systematic, shared by epochs
+    P = np.full((n_draws, n_ep), np.nan)
+
+    for j in range(n_ep):
+        if not is_limit[j]:
+            e = rng.normal(0.0, 1.0, n_draws) * sig_score[j]
+            P[:, j] = _tail_from_grid(truth_mu[:, j] + e, G[:, j], sig[j], lim[j])
+            continue
+
+        M_lim_j = depth[j]
+        if not np.isfinite(M_lim_j):
+            continue                  # no quoted depth: column stays NaN
+
+        F_thresh = flux_of(M_lim_j)
+        s_phot = flux_sigma_of_limit(M_lim_j, n_sigma_limit)
+        P_detect = float(ndtr((flux_of(G[:, j]) - F_thresh) / s_phot).mean())
+        if P_detect < nondetection_gate:
+            # The scorer excludes this epoch from combining outright, so it is
+            # not part of the correlation the combiner needs either.
+            continue
+
+        F_meas = flux_of(truth_mu[:, j]) + rng.normal(0.0, s_phot, n_draws)
+        detected = F_meas >= F_thresh
+        # non-detection: the constant score the scorer reports, capped as it is
+        P[~detected, j] = min(1.0 - P_detect, 0.5)
+        if detected.any():
+            F_d = np.clip(F_meas[detected], 1e-300, None)
+            m_d = -2.5 * np.log10(F_d)
+            s_d = (2.5 / np.log(10.0)) * s_phot / F_d
+            # `_tail_from_grid` takes ONE sigma per call and these differ per
+            # draw, so group them by sigma and use each group's median.
+            out = np.empty(m_d.size)
+            order = np.argsort(s_d)
+            for c in np.array_split(order, min(20, max(order.size, 1))):
+                if c.size:
+                    out[c] = _tail_from_grid(m_d[c], G[:, j],
+                                             float(np.median(s_d[c])), lim[j])
+            P[detected, j] = out
+    return P
 
 
 def estimate_rho(
@@ -1074,6 +1120,9 @@ def estimate_rho(
     eps: float = 1e-4,
     random_state: Optional[int] = None,
     return_matrix: bool = False,
+    limit_mode: str = "survey",
+    n_sigma_limit: float = 5.0,
+    nondetection_gate: float = 0.5,
 ):
     """Mean inter-epoch correlation of the normal scores, measured on the grid at
     THIS candidate's cadence.
@@ -1142,11 +1191,27 @@ def estimate_rho(
             "falling back to observed_mag_err.", sigma_col,
         )
         sigma_col = None
+    if limit_mode not in ("survey", "drop"):
+        raise ValueError("limit_mode must be 'survey' or 'drop'; got %r."
+                         % (limit_mode,))
     G, sig, lim, rows = _epoch_grid(metric_df, data_sim, time_bin_width, sigma_col)
     if G is None or G.shape[1] < 2 or G.shape[0] < 10:
         return (float("nan"), None) if return_matrix else float("nan")
 
-    P = _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng)
+    # Limit epochs need the survey-realised simulation; see _simulate_epoch_p.
+    # `limit_mode="drop"` restores the previous behaviour, which is not "drop"
+    # by intent -- it kept the columns and lost them to NaN -- but is what the
+    # old code did, kept so the change is measurable rather than asserted.
+    is_lim = (rows["is_limit"].to_numpy(dtype=bool)
+              if "is_limit" in rows.columns
+              else np.zeros(len(rows), dtype=bool))
+    if limit_mode == "survey" and is_lim.any():
+        P = _simulate_epoch_p(
+            G, sig, lim, sigma_mu, n_draws, rng,
+            is_limit=is_lim, depth=rows["observed_mag"].to_numpy(dtype=float),
+            n_sigma_limit=n_sigma_limit, nondetection_gate=nondetection_gate)
+    else:
+        P = _simulate_epoch_p(G, sig, lim, sigma_mu, n_draws, rng)
     Z = ndtri(1.0 - np.clip(P, eps, 1.0 - eps))
     C = np.corrcoef(Z, rowvar=False)
     iu = np.triu_indices_from(C, k=1)
@@ -1285,6 +1350,7 @@ def kilonovascorer_v3(
     is_limit_col: str = "is_limit",
     n_sigma_limit: float = 5.0,
     flux_zp: float = 0.0,
+    nondetection_gate: float = 0.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Score a kilonova candidate against a simulation grid.
@@ -1473,6 +1539,40 @@ def kilonovascorer_v3(
         with NaN.  P_near_KNe is a per-observation diagnostic that is never
         aggregated, so disabling it leaves P_tail_KNe, the cumulative score and
         the ABC diagnostics unchanged.
+    space : {"magnitude", "flux"}
+        Space a real DETECTION is compared in.  ``"magnitude"`` (default)
+        is unchanged from before this option existed.  ``"flux"`` runs the
+        same P_tail machinery on exponentiated values instead -- a
+        legitimate but numerically DIFFERENT test, not interchangeable with
+        magnitude-space scores for the same epoch.
+    score_limits : bool
+        If True, rows flagged by ``is_limit_col`` are scored via
+        ``nondetection_tail`` instead of being dropped.  Default False
+        reproduces every prior result unchanged.  See ``nondetection_gate``
+        below for how a limit's score is allowed to affect combining.
+    is_limit_col : str
+        Column flagging a non-detection row.  Its ``absolute_magnitude`` is
+        read as that row's own quoted limiting magnitude.
+    n_sigma_limit : float
+        Significance the quoted depth was reported at (paper-specific --
+        get it from the source, don't guess).
+    flux_zp : float
+        Flux zeropoint; cancels out of every probability, kept only to keep
+        numbers near order-unity.
+    nondetection_gate : float
+        A non-detection's ``p_tail_mean`` only enters combining
+        (Stouffer/Strube or IVW) when its ``F_hat`` (= P_detect, the
+        model's own detection probability) is at least this value;
+        otherwise it is excluded (NaN), the same as being dropped. One that
+        does pass is additionally capped at ``min(p_tail_mean, 0.5)``. Both
+        exist for the same reason: Stouffer maps ``p_tail_mean -> 1`` to
+        strong evidence FOR the model, but most non-detections are simply
+        uninformative, so an uncapped, ungated non-detection can inflate a
+        candidate's score toward 1 regardless of what its detections say.
+        The gate excludes epochs that carry no information at all; the cap
+        ensures the ones that remain can only argue tension (push the score
+        down), never confirmation. Default 0.5 is a starting point, not a
+        swept value -- see ``docs/FLUX_SPACE.md``.
 
     Returns
     -------
@@ -1495,6 +1595,10 @@ def kilonovascorer_v3(
     if not (np.isfinite(n_sigma_limit) and n_sigma_limit > 0):
         raise ValueError(
             "n_sigma_limit must be finite and positive; got %r." % (n_sigma_limit,)
+        )
+    if not (np.isfinite(nondetection_gate) and 0.0 <= nondetection_gate <= 1.0):
+        raise ValueError(
+            "nondetection_gate must be in [0, 1]; got %r." % (nondetection_gate,)
         )
 
     results: List[Dict[str, Any]] = []
@@ -1676,6 +1780,19 @@ def kilonovascorer_v3(
                     mag_bin, M_lim=M_obs,
                     n_sigma_limit=n_sigma_limit, flux_zp=flux_zp,
                 )
+                # Stouffer maps p_tail_mean -> 1 to strong evidence FOR the
+                # model, but most non-detections are simply uninformative
+                # (nothing was expected to be seen). Gate: exclude those
+                # entirely rather than let them count as confirmation. Cap:
+                # even an informative one can only say "tension" (z >= 0),
+                # never "confirms" (z < 0) -- see docs/FLUX_SPACE.md.
+                metric["p_tail_nondetect_raw"] = metric["p_tail_mean"]
+                if metric["F_hat"] < nondetection_gate:
+                    metric["p_tail_KNe"] = float("nan")
+                    metric["p_tail_mean"] = float("nan")
+                else:
+                    metric["p_tail_KNe"] = min(metric["p_tail_KNe"], 0.5)
+                    metric["p_tail_mean"] = min(metric["p_tail_mean"], 0.5)
             else:
                 score_bin, score_M_obs, score_sigma_obs = mag_bin, M_obs, sigma_obs
                 score_M_lim = M_lim_row
@@ -1780,6 +1897,7 @@ def kilonovascorer_v3(
                 "p_tail_method": metric["p_tail_method"],
                 "space": space,
                 "is_limit": bool(is_limit_row),
+                "p_tail_nondetect_raw": metric.get("p_tail_nondetect_raw", np.nan),
                 "n_sim_bin": n_bin,
                 "n_consistent_lcs": len(consistent_ids),
                 "consistent_ids": consistent_ids if abc_return_ids else [],
