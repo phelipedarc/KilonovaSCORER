@@ -193,17 +193,12 @@ def compute_abs_mag_samples(
             return mean, std, phot, float(sig_mu)
         return mean, std
 
-    # The photometric term needs no Monte Carlo: the distance modulus is
-    # additive, so it shifts the absolute magnitude without touching its
-    # photometric spread.  sigma_phot in absolute magnitude IS app_mag_err.
     abs_mag_std_phot = np.where(np.isfinite(app_mag), app_mag_err, np.nan)
 
     if not np.isfinite(dist_mpc) or dist_mpc <= 0:
         logger.warning("Invalid distance dist_mpc=%.3f — returning NaN.", dist_mpc)
         return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
-    # Sample distance modulus (shared across all observations — distance is a
-    # global systematic, not an independent draw per row)
     D_samples = np.random.normal(dist_mpc, dist_err_mpc, n_samples) * 1e6  # parsecs
     D_samples = D_samples[D_samples > 0]
 
@@ -217,8 +212,6 @@ def compute_abs_mag_samples(
 
     n_valid = len(D_samples)
     mu_samples = 5.0 * np.log10(D_samples) - 5.0  # shape (n_valid,)
-    # The shared systematic, as one number.  Measured from the same draws the
-    # totals are built from, so it is consistent with them by construction.
     sigma_mu = float(np.std(mu_samples))
 
     for i in range(n_obs):
@@ -333,90 +326,6 @@ def stouffer_combine(
     ``stouffer_combine`` because that is what it is at the default, and because
     a correlation argument on Stouffer is the standard interface (R's ``poolr``
     spells it ``stouffer(..., adjust=)``).
-
-    Parameters
-    ----------
-    p : array-like
-        Per-epoch p-values (``p_tail_mean``).  Non-finite entries are dropped.
-        Zeros are KEPT and clamped to ``eps``: a categorically-rejected epoch is
-        the strongest evidence available, not missing data.
-    Weights
-    -------
-    There are none, and that is deliberate rather than a default.  Equal
-    weighting is a MEASURED result: seven ancillary schemes were tested on
-    held-out kilonovae plus three contaminant classes (``WEIGHTS.md``) and none
-    beat it beyond noise, nor did the oracle weight ``w ~ mu_i`` that is
-    provably optimal by Cauchy-Schwarz.  The ceiling on any weighting gain is
-    ``sqrt(1 + CV^2)`` with CV the spread of per-epoch informativeness,
-    measured at 0.060 -> a 0.18% gain, two orders of magnitude under the AUC
-    noise floor.  Epoch informativeness is set by the grid's own population
-    spread ``tau`` (0.21-0.56 mag), which dominates ``sigma_obs`` and barely
-    varies across epochs, so there is little for weights to exploit.
-
-    Weighting also costs something exact.  Stouffer accumulates like
-    ``sqrt(n_eff)`` with ``n_eff = (sum w)^2 / sum(w^2)`` (Kish), and
-    ``n_eff <= n`` for every non-uniform weighting, so unequal weights always
-    spend effective epochs for a power gain that has to be real to pay for it.
-
-    And the ``rho`` correction below stops being exact.  The scalar form
-    assumes EXCHANGEABLE correlation, under which the mean off-diagonal is the
-    off-diagonal.  Equal weights preserve that; unequal weights do not, so a
-    weighted Z would carry a normaliser that is wrong by an unknown amount.
-    Inverse-variance weights inside Stouffer were tested for exactly this and
-    rejected on that ground -- if per-epoch variances are what you want to
-    weight by, use :func:`ivw_stats_logit`, which is built for it.
-
-    eps : float
-        Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
-    rho : float
-        Exchangeable inter-epoch correlation of the normal scores.  ``0.0``
-        (the default) assumes independence; any positive value applies
-        **Strube's correction** to the normaliser::
-
-            Var(sum w_i z_i) = sum_i sum_j w_i w_j rho_ij
-                             = sum(w^2) + rho * [ (sum w)^2 - sum(w^2) ]
-
-        which for equal weights reduces to Strube's published form
-        ``Z = sum(z) / sqrt(n + rho*n*(n-1))``.
-
-        Epochs of one candidate ARE correlated -- same object, one smooth light
-        curve, one shared distance draw -- with a mean of **0.284** measured on
-        the grid.  Measure it for a given candidate with
-        :func:`KilonovaScorer.core2.estimate_rho`, which evaluates the
-        correlation at that candidate's own cadence rather than borrowing a
-        number.
-
-        Positive correlation makes the true variance larger than ``sum(w^2)``,
-        so ``rho = 0`` is **overconfident by a known direction**.  Measured on
-        20,000 exchangeably-correlated nulls of six epochs, KS against U(0,1)
-        (5% critical value 0.0096):
-
-        =========  =================  ==================
-        true rho   Stouffer (rho=0)   Strube (rho=true)
-        =========  =================  ==================
-        0.000                 0.0090              0.0090
-        0.100                 0.0535              0.0069
-        0.284                 0.1111              0.0065
-        0.500                 0.1495              0.0059
-        0.800                 0.1874              0.0053
-        =========  =================  ==================
-
-        Strube holds calibration at every correlation; uncorrected Stouffer is
-        outside the critical value as soon as rho exceeds ~0.05.
-
-        rho is estimated, so misspecification matters.  At a true rho of 0.284,
-        passing 0.0 gives KS 0.1036 and 0.2 gives 0.0232, while 0.4 gives 0.0283
-        and 0.9 gives 0.1009.  **Erring high is safe and erring low is not** --
-        too large a rho is merely conservative (the score rises), too small
-        leaves the overconfidence it was meant to remove.
-
-        It costs no power.  At fixed ``n`` the correction divides Z by a
-        constant, so it is a monotone transform: the candidate ordering and the
-        AUC are unchanged to machine precision.  What it changes is the
-        comparison ACROSS candidates with different epoch counts, where
-        uncorrected Stouffer keeps crediting every extra correlated epoch as
-        independent evidence -- at 48 epochs it is optimistic by 796x relative
-        to Strube, against 1.1x at two epochs.
 
     Returns
     -------
@@ -595,24 +504,15 @@ def calculate_sequential_score_logit(
     z     = logit(means_clipped)
     z_std = stds / (means_clipped * (1.0 - means_clipped))  # delta method
 
-    # A bin is usable only if its precision 1/z_std**2 is finite AND positive.
-    # Testing np.isfinite(z_std) alone is not enough: 0.0 is finite, so a
-    # zero-variance bin passed the old check and produced infinite precision.
-    # The update (finite*finite + z*inf) / inf then evaluates to NaN, and every
-    # subsequent bin inherits it.
     valid = np.isfinite(z) & np.isfinite(z_std) & (z_std > 0.0)
 
-    # Initialise from the first VALID bin, not unconditionally from bin 0.
-    # Bin 0 was never checked, so a single bad first bin set current_prec to inf
-    # and NaN-poisoned the entire running score.  Bins before the first valid
-    # one are reported NaN rather than given a fabricated value.
     first = int(np.argmax(valid)) if valid.any() else -1
     if first < 0:
         # No usable bin.  Return all-NaN rather than indexing z[0], which used
         # to raise IndexError on an empty frame.
         return running_score, running_error
 
-    current_z    = z[first]
+    current_z = z[first]
     current_prec = 1.0 / z_std[first] ** 2
     running_score[first] = float(means_clipped[first])
     running_error[first] = float(stds[first])
@@ -624,11 +524,11 @@ def calculate_sequential_score_logit(
             running_error[i] = running_error[i - 1]
             continue
 
-        new_prec     = 1.0 / z_std[i] ** 2
+        new_prec = 1.0 / z_std[i] ** 2
         updated_prec = current_prec + new_prec
-        updated_z    = (current_z * current_prec + z[i] * new_prec) / updated_prec
+        updated_z = (current_z * current_prec + z[i] * new_prec) / updated_prec
 
-        current_z    = updated_z
+        current_z = updated_z
         current_prec = updated_prec
 
         score_i = float(expit(updated_z))
