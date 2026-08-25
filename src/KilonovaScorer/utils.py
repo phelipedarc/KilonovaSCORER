@@ -16,30 +16,105 @@ import logging
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from typing import List, Optional
+
+from scipy.special import expit, logit, ndtr, ndtri
 
 logger = logging.getLogger(__name__)
 
-#: Floor applied to ``p_tail_std`` before inverse-variance weighting.
-#:
-#: A categorically-rejected epoch returns ``p_tail_mean == 0`` AND
-#: ``p_tail_std == 0`` — every realisation of M_obs lands outside the simulated
-#: range, so the spread of a constant is zero.  Such an epoch carries the
-#: strongest possible evidence and must be kept, but ``w = 1/z_std**2`` divides
-#: by zero at ``s == 0``.  Flooring makes the weight large but finite.
-#:
-#: This is a SCIENTIFIC LEVER, not a numerical detail: it sets how hard a
-#: categorically-rejected bin can pull the cumulative score down.
-#:
-#: ``None`` means "use ``eps``", which is the self-consistent choice: claiming
-#: to know a probability better than the resolution it is stored at is not
-#: defensible.  It gives a rejected epoch ``z = logit(eps) = -9.21`` at
-#: ``z_std ~ 1``, i.e. unit weight — against ~25 for a well-measured epoch at
-#: ``p = 0.5 +/- 0.05``.  So a rejection drags a bin down without
-#: single-handedly deciding it.  The looser ``1/sqrt(n_obs) = 0.1`` alternative
-#: weights rejections roughly 10x less; it was not adopted, but this constant
-#: exists so the choice can be revisited without touching the arithmetic.
 P_TAIL_STD_FLOOR = None
+
+
+# ---------------------------------------------------------------------------
+# Flux-space conversions and non-detection scoring
+# ---------------------------------------------------------------------------
+
+def flux_of(M, zp=0.0):
+    """Absolute magnitude -> flux: ``F = 10**(-0.4*(M - zp))``. Monotone
+    decreasing, so brighter = larger F, opposite of magnitude. ``zp`` cancels
+    out of every probability computed from F; it only keeps values near
+    order-unity."""
+    return 10.0 ** (-0.4 * (np.asarray(M, dtype=float) - zp))
+
+
+def flux_sigma_of(M, sigma_mag, zp=0.0):
+    """Delta-method flux uncertainty from a magnitude uncertainty:
+    ``sigma_F = F * ln(10)/2.5 * sigma_mag``. Only valid for a real detection
+    -- a non-detection has no magnitude to propagate from, see
+    :func:`flux_sigma_of_limit`."""
+    F = flux_of(M, zp)
+    return F * (np.log(10.0) / 2.5) * np.asarray(sigma_mag, dtype=float)
+
+
+def flux_sigma_of_limit(M_lim, n_sigma=5.0, zp=0.0):
+    """Flux uncertainty implied by a quoted N-sigma non-detection depth:
+    ``sigma_F = flux_of(m_lim) / n_sigma``."""
+    return flux_of(M_lim, zp) / float(n_sigma)
+
+
+def _flux_score_axis(M, zp=0.0):
+    """Negated flux, for internal use by the scorer only.
+
+    The P_tail machinery assumes smaller = brighter (true of magnitude,
+    false of flux). Feeding it raw flux would flip the sign of F_hat and
+    invert the M_lim detectability weight's direction. Negating both m and
+    M_lim restores the magnitude-like convention; F_hat/P_tail/p_tail_mean/
+    P_near are all invariant to a simultaneous sign flip, so nothing else
+    needs to change.
+    """
+    return -flux_of(M, zp)
+
+
+def nondetection_tail(sim_values, M_lim, n_sigma_limit=5.0, flux_zp=0.0):
+    """P_tail for a non-detection -- a different test from P_tail_KNe, not
+    the same machinery fed an imputed measurement.
+
+    A non-detection is censored ("flux below threshold"), not a point
+    measurement at zero -- treating it as one saturates the ordinary PIT
+    (real fluxes sit many sigma above zero, so every simulation's term
+    collapses to 1 regardless of brightness; see
+    ``sim/flux_space_validate.py``). Instead this uses the standard
+    censored-data likelihood for an upper limit::
+
+        P_detect = mean_sim( Phi((F_sim - F_thresh) / sigma_phot) )
+        p_tail   = 1 - P_detect
+
+    No two-sided fold: the observed outcome (non-detection) is fixed, so
+    this is a one-sided p-value, not a PIT.
+
+    Parameters
+    ----------
+    sim_values : array-like
+        Simulated absolute magnitudes for the relevant time bin.
+    M_lim : float
+        This observation's own quoted limiting absolute magnitude.
+    n_sigma_limit : float
+        Significance the depth was quoted at.
+    flux_zp : float
+        Flux zeropoint; cancels out of every probability.
+
+    Returns
+    -------
+    dict with ``F_hat`` (= P_detect), ``p_tail_KNe``, ``p_tail_mean``
+    (identical -- no jitter average here), ``p_tail_std`` (NaN),
+    ``p_near_KNe`` (NaN), ``n_eff``, ``scoreable`` (always True),
+    ``p_tail_method`` (``"nondetection"``).
+    """
+    F_sim = flux_of(np.asarray(sim_values, dtype=float), flux_zp)
+    F_thresh = flux_of(M_lim, flux_zp)
+    sigma_phot = flux_sigma_of_limit(M_lim, n_sigma_limit, flux_zp)
+    P_detect = float(ndtr((F_sim - F_thresh) / sigma_phot).mean())
+    p_tail = 1.0 - P_detect
+    return {
+        "F_hat": P_detect,
+        "p_tail_KNe": p_tail,
+        "p_tail_mean": p_tail,
+        "p_tail_std": float("nan"),
+        "p_near_KNe": float("nan"),
+        "n_eff": float(np.asarray(sim_values).size),
+        "scoreable": True,
+        "p_tail_method": "nondetection",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +127,7 @@ def compute_abs_mag_samples(
     dist_mpc: float,
     dist_err_mpc: float,
     n_samples: int = 5000,
+    return_components: bool = False,
 ):
     """
     Convert apparent magnitude(s) to absolute magnitude via Monte Carlo sampling.
@@ -77,6 +153,9 @@ def compute_abs_mag_samples(
         Uncertainty on the luminosity distance in Mpc.
     n_samples : int
         Number of Monte Carlo draws per observation.
+    return_components : bool
+        Also return the two terms the total is built from.  ``False`` (default)
+        preserves the original two-value return exactly.
 
     Returns
     -------
@@ -84,13 +163,13 @@ def compute_abs_mag_samples(
         Mean absolute magnitude(s).  np.nan for invalid inputs.
     abs_mag_std : float or np.ndarray
         Standard deviation of absolute magnitude(s).  np.nan for invalid inputs.
-
-    Notes
-    -----
-    When called with arrays, one independent set of ``n_samples`` distance
-    draws is shared across all rows (same distance realisation), while
-    apparent-magnitude noise is drawn independently per row.  This correctly
-    reflects that the distance uncertainty is a global systematic.
+    abs_mag_std_phot : float or np.ndarray
+        Returned only when ``return_components``.  The PHOTOMETRIC term alone,
+        i.e. ``app_mag_err``: independent per observation.
+    sigma_mu : float
+        Returned only when ``return_components``.  The distance-modulus
+        uncertainty: ONE number for the whole candidate, identical at every
+        epoch.
     """
     scalar_input = np.ndim(app_mag) == 0
 
@@ -106,9 +185,22 @@ def compute_abs_mag_samples(
     abs_mag_std  = np.full(n_obs, np.nan)
 
     # Global distance validation
+    def _out(mean, std, phot, sig_mu):
+        if scalar_input:
+            mean, std = float(mean[0]), float(std[0])
+            phot = float(phot[0])
+        if return_components:
+            return mean, std, phot, float(sig_mu)
+        return mean, std
+
+    # The photometric term needs no Monte Carlo: the distance modulus is
+    # additive, so it shifts the absolute magnitude without touching its
+    # photometric spread.  sigma_phot in absolute magnitude IS app_mag_err.
+    abs_mag_std_phot = np.where(np.isfinite(app_mag), app_mag_err, np.nan)
+
     if not np.isfinite(dist_mpc) or dist_mpc <= 0:
         logger.warning("Invalid distance dist_mpc=%.3f — returning NaN.", dist_mpc)
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
     # Sample distance modulus (shared across all observations — distance is a
     # global systematic, not an independent draw per row)
@@ -121,10 +213,13 @@ def compute_abs_mag_samples(
             "dist_err_mpc=%.3f.  Returning NaN.",
             dist_mpc, dist_err_mpc,
         )
-        return (float("nan"), float("nan")) if scalar_input else (abs_mag_mean, abs_mag_std)
+        return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, np.nan)
 
     n_valid = len(D_samples)
     mu_samples = 5.0 * np.log10(D_samples) - 5.0  # shape (n_valid,)
+    # The shared systematic, as one number.  Measured from the same draws the
+    # totals are built from, so it is consistent with them by construction.
+    sigma_mu = float(np.std(mu_samples))
 
     for i in range(n_obs):
         if not np.isfinite(app_mag[i]):
@@ -137,9 +232,7 @@ def compute_abs_mag_samples(
         abs_mag_mean[i] = np.mean(abs_samples)
         abs_mag_std[i]  = np.std(abs_samples)
 
-    if scalar_input:
-        return float(abs_mag_mean[0]), float(abs_mag_std[0])
-    return abs_mag_mean, abs_mag_std
+    return _out(abs_mag_mean, abs_mag_std, abs_mag_std_phot, sigma_mu)
 
 
 # ---------------------------------------------------------------------------
@@ -197,26 +290,6 @@ def ivw_stats_logit(
         ``binned_stats_cumulative_ptail`` then deleted the entire bin on the
         strength of that missing field alone.
     """
-    # Zero scores are KEPT.  This used to open with
-    #     valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
-    # which silently deleted exactly the epochs carrying the most evidence: an
-    # epoch the simulation grid flatly excludes scores p_tail_mean == 0, and
-    # because every realisation of M_obs then lands outside the grid, the
-    # spread of that constant is p_tail_std == 0 too.  Both conditions fired,
-    # so the row was dropped — and the `(s > 0)` mask below dropped it again.
-    #
-    # The failure mode is not the fully-rejected bin, which returned 0.0 and
-    # looked wrong.  It is PARTIAL rejection, which is silent: with 4 of 5
-    # epochs rejecting the candidate, the bin scored 0.7300 — a confident
-    # kilonova-like verdict assembled from the single epoch that happened to
-    # survive the filter.  Nothing downstream can detect this, because the
-    # result is finite and plausible; the ABC survivor count in the same frame
-    # is only consulted on the NaN path, which partial rejection never reaches.
-    #
-    # `eps` was always what held zeros off the logit singularity, so the
-    # p_tail_mean filter was redundant as well as destructive.  The p_tail_std
-    # condition cannot simply be deleted — `weights = 1/z_std**2` divides by
-    # zero at s == 0 — so it is replaced by a floor (P_TAIL_STD_FLOOR).
     p = group["p_tail_mean"].to_numpy(dtype=float)
     s = group["p_tail_std"].to_numpy(dtype=float)
 
@@ -226,9 +299,7 @@ def ivw_stats_logit(
     if len(p) == 0:
         return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
 
-    # Floor s == 0 rather than dropping it.  A zero reported std means "this
-    # epoch is infinitely informative", which is never true, and it would reach
-    # the precision accumulator as 1/0**2 = inf.
+    # Floor s == 0 rather than dropping it
     floor = s_floor if s_floor is not None else P_TAIL_STD_FLOOR
     if floor is None:
         floor = eps
@@ -246,6 +317,230 @@ def ivw_stats_logit(
 
     return pd.Series({"mean": mean, "std": std, "count": len(p)})
 
+def stouffer_combine(
+    p,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Combine p-values by the weighted Stouffer method, with Strube's
+    correlation correction.
+
+    ``rho = 0`` is Stouffer (1949); ``rho > 0`` is **Strube's method** (Strube
+    1985, *Psychological Bulletin* 97, 334-341), the generalisation of Stouffer
+    to non-independent tests.  Both are the same function because they differ
+    only in the normaliser -- see ``rho`` below.  The name stays
+    ``stouffer_combine`` because that is what it is at the default, and because
+    a correlation argument on Stouffer is the standard interface (R's ``poolr``
+    spells it ``stouffer(..., adjust=)``).
+
+    Parameters
+    ----------
+    p : array-like
+        Per-epoch p-values (``p_tail_mean``).  Non-finite entries are dropped.
+        Zeros are KEPT and clamped to ``eps``: a categorically-rejected epoch is
+        the strongest evidence available, not missing data.
+    Weights
+    -------
+    There are none, and that is deliberate rather than a default.  Equal
+    weighting is a MEASURED result: seven ancillary schemes were tested on
+    held-out kilonovae plus three contaminant classes (``WEIGHTS.md``) and none
+    beat it beyond noise, nor did the oracle weight ``w ~ mu_i`` that is
+    provably optimal by Cauchy-Schwarz.  The ceiling on any weighting gain is
+    ``sqrt(1 + CV^2)`` with CV the spread of per-epoch informativeness,
+    measured at 0.060 -> a 0.18% gain, two orders of magnitude under the AUC
+    noise floor.  Epoch informativeness is set by the grid's own population
+    spread ``tau`` (0.21-0.56 mag), which dominates ``sigma_obs`` and barely
+    varies across epochs, so there is little for weights to exploit.
+
+    Weighting also costs something exact.  Stouffer accumulates like
+    ``sqrt(n_eff)`` with ``n_eff = (sum w)^2 / sum(w^2)`` (Kish), and
+    ``n_eff <= n`` for every non-uniform weighting, so unequal weights always
+    spend effective epochs for a power gain that has to be real to pay for it.
+
+    And the ``rho`` correction below stops being exact.  The scalar form
+    assumes EXCHANGEABLE correlation, under which the mean off-diagonal is the
+    off-diagonal.  Equal weights preserve that; unequal weights do not, so a
+    weighted Z would carry a normaliser that is wrong by an unknown amount.
+    Inverse-variance weights inside Stouffer were tested for exactly this and
+    rejected on that ground -- if per-epoch variances are what you want to
+    weight by, use :func:`ivw_stats_logit`, which is built for it.
+
+    eps : float
+        Clamp keeping p away from 0 and 1, where ``Phi^-1`` is infinite.
+    rho : float
+        Exchangeable inter-epoch correlation of the normal scores.  ``0.0``
+        (the default) assumes independence; any positive value applies
+        **Strube's correction** to the normaliser::
+
+            Var(sum w_i z_i) = sum_i sum_j w_i w_j rho_ij
+                             = sum(w^2) + rho * [ (sum w)^2 - sum(w^2) ]
+
+        which for equal weights reduces to Strube's published form
+        ``Z = sum(z) / sqrt(n + rho*n*(n-1))``.
+
+        Epochs of one candidate ARE correlated -- same object, one smooth light
+        curve, one shared distance draw -- with a mean of **0.284** measured on
+        the grid.  Measure it for a given candidate with
+        :func:`KilonovaScorer.core2.estimate_rho`, which evaluates the
+        correlation at that candidate's own cadence rather than borrowing a
+        number.
+
+        Positive correlation makes the true variance larger than ``sum(w^2)``,
+        so ``rho = 0`` is **overconfident by a known direction**.  Measured on
+        20,000 exchangeably-correlated nulls of six epochs, KS against U(0,1)
+        (5% critical value 0.0096):
+
+        =========  =================  ==================
+        true rho   Stouffer (rho=0)   Strube (rho=true)
+        =========  =================  ==================
+        0.000                 0.0090              0.0090
+        0.100                 0.0535              0.0069
+        0.284                 0.1111              0.0065
+        0.500                 0.1495              0.0059
+        0.800                 0.1874              0.0053
+        =========  =================  ==================
+
+        Strube holds calibration at every correlation; uncorrected Stouffer is
+        outside the critical value as soon as rho exceeds ~0.05.
+
+        rho is estimated, so misspecification matters.  At a true rho of 0.284,
+        passing 0.0 gives KS 0.1036 and 0.2 gives 0.0232, while 0.4 gives 0.0283
+        and 0.9 gives 0.1009.  **Erring high is safe and erring low is not** --
+        too large a rho is merely conservative (the score rises), too small
+        leaves the overconfidence it was meant to remove.
+
+        It costs no power.  At fixed ``n`` the correction divides Z by a
+        constant, so it is a monotone transform: the candidate ordering and the
+        AUC are unchanged to machine precision.  What it changes is the
+        comparison ACROSS candidates with different epoch counts, where
+        uncorrected Stouffer keeps crediting every extra correlated epoch as
+        independent evidence -- at 48 epochs it is optimistic by 796x relative
+        to Strube, against 1.1x at two epochs.
+
+    Returns
+    -------
+    dict with keys ``p_combined``, ``Z``, ``count``.
+        ``p_combined`` is itself a p-value on (0, 1) — small means inconsistent
+        with the kilonova hypothesis, the same orientation as ``P_tail``.
+    """
+    p = np.asarray(p, dtype=float)
+    p = p[np.isfinite(p)]
+
+    n = p.size
+    if n == 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": 0}
+
+    p_clipped = np.clip(p, eps, 1.0 - eps)
+    z = ndtri(1.0 - p_clipped)          # uniform in -> standard normal out
+
+    num = float(np.sum(z))
+    # Strube 1985 eq. for equal weights: Var(sum z) = n + rho*n*(n-1).
+    var = float(n) + float(rho) * float(n) * float(n - 1)
+    if not np.isfinite(var) or var <= 0:
+        return {"p_combined": np.nan, "Z": np.nan, "count": int(n)}
+
+    Z = num / np.sqrt(var)
+    return {
+        "p_combined": float(ndtr(-Z)),   # 1 - Phi(Z), computed stably
+        "Z": float(Z),
+        "count": int(n),
+    }
+
+
+def stouffer_stats(
+    group: pd.DataFrame,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+) -> pd.Series:
+    """
+    Per-time-bin Stouffer combination, shaped as a drop-in for
+    :func:`ivw_stats_logit`.
+
+    Parameters
+    ----------
+    group : pd.DataFrame
+        Subset of the metrics DataFrame for a single time bin.  Must contain
+        ``p_tail_mean``.  ``p_tail_std`` is neither required nor read — that is
+        the point of the change.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+
+    Returns
+    -------
+    pd.Series
+        ``mean``  – the combined p-value for this bin.
+        ``std``   – standard error of the epoch spread about the mean, i.e. how
+                    much the epochs in this bin disagree.  This is NOT a
+                    propagated measurement error and is 0.0 for a single epoch;
+                    nothing downstream weights by it.
+        ``count`` – number of epochs combined.
+
+        All return paths carry all three keys, so ``groupby(...).apply(...)``
+        cannot introduce a spurious NaN column for ``dropna`` to act on.
+    """
+    p = group["p_tail_mean"].to_numpy(dtype=float)
+    res = stouffer_combine(p, eps=eps, rho=rho)
+    if res["count"] == 0:
+        return pd.Series({"mean": np.nan, "std": np.nan, "count": 0})
+
+    finite = p[np.isfinite(p)]
+    spread = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+              if finite.size > 1 else 0.0)
+    return pd.Series({
+        "mean": res["p_combined"],
+        "std": spread,
+        "count": res["count"],
+    })
+
+
+def calculate_sequential_score_stouffer(
+    p_by_bin,
+    eps: float = 1e-4,
+    rho: float = 0.0,
+):
+    """
+    Cumulative score after each time bin, by Stouffer combination.
+
+    The running score at bin ``k`` combines every epoch from bins ``0..k``
+    directly from their per-epoch p-values, rather than re-combining
+    already-combined bin scores.  Combining p-values is associative only if the
+    inputs stay uniform, and a combined p-value is uniform but no longer
+    independent of its own components, so going back to the raw epochs is both
+    simpler and exactly calibrated at every ``k``.
+
+    Parameters
+    ----------
+    p_by_bin : sequence of array-like
+        Per-epoch p-values, grouped by time bin, in chronological order.
+    eps, rho : float
+        See :func:`stouffer_combine`.
+
+    Returns
+    -------
+    running_score : np.ndarray
+        Cumulative combined p-value after each bin.
+    running_err : np.ndarray
+        Standard error of the epoch spread accumulated so far.  Reported for
+        schema compatibility; it is a dispersion, not a propagated error, and
+        nothing consumes it as a weight.
+    """
+    n = len(p_by_bin)
+    running_score = np.full(n, np.nan)
+    running_err = np.full(n, np.nan)
+
+    acc_p: List[float] = []
+    for i in range(n):
+        acc_p.extend(np.asarray(p_by_bin[i], dtype=float).ravel().tolist())
+        res = stouffer_combine(acc_p, eps=eps, rho=rho)
+        running_score[i] = res["p_combined"]
+
+        finite = np.asarray(acc_p, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        running_err[i] = (float(np.std(finite, ddof=1) / np.sqrt(finite.size))
+                          if finite.size > 1 else 0.0)
+
+    return running_score, running_err
 
 # ---------------------------------------------------------------------------
 # Sequential logit-space cumulative score update
@@ -341,9 +636,6 @@ def calculate_sequential_score_logit(
         running_error[i] = score_i * (1.0 - score_i) * np.sqrt(1.0 / updated_prec)
 
     return running_score, running_error
-
-
-
 
 def timer_warp(func):
     @wraps(func)
