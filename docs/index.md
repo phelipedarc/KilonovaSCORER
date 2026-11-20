@@ -8,7 +8,7 @@ It was built for the early, sparse-data phase of gravitational-wave follow-up (f
 
 ```{admonition} It ranks, it does not classify
 :class: important
-The score tells you *which candidates to follow up first*. It is not a yes/no kilonova test.
+The score tells you *which candidates to follow up first* and should not be used as a classifier.
 ```
 
 ## 30-second example
