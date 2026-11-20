@@ -162,7 +162,7 @@ def ivw_stats_logit(group: pd.DataFrame, eps: float = 1e-4) -> pd.Series:
     valid = (group["p_tail_std"] > 0) & (group["p_tail_mean"] > 0)
     group = group[valid]
     if group.empty:
-        return pd.Series({"mean": 0.0, "std": 0.0})
+        return pd.Series({"mean": 0.0, "std": 0.0, "count": 0})
       
     p = group["p_tail_mean"].to_numpy()
     s = group["p_tail_std"].to_numpy()
