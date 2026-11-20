@@ -247,7 +247,7 @@ def predictive_tail_kde(
     sim_values: np.ndarray,
     M_obs: float,
     sigma_obs: float,
-    k: float = 1.5,
+    k: float = 3.0,
     n_sim: int = 50000,
     n_obs: int = 100,
     kde: Optional[gaussian_kde] = None,
@@ -288,7 +288,7 @@ def predictive_tail_kde(
     sigma_obs : float
         Observational uncertainty on M_obs (paper notation: sigma_obs).
     k : float
-        ROPE half-width factor.  Paper fiducial value: 1.5.
+        ROPE half-width factor.  Paper fiducial value: 3.0.
     n_sim : int
         Number of Monte Carlo draws for the noise-convolved PPD.
     n_obs : int
@@ -328,7 +328,7 @@ def predictive_tail_kde(
     p_tail_KNe = 2.0 * min(F_hat, 1.0 - F_hat)
 
     # 3. P_near_KNe — fraction of noise-convolved PPD draws within the ROPE
-    #    (paper eq. 4; k=1.5 fiducial).  Not aggregated across epochs.
+    #    (paper eq. 15-17; k=3.0 fiducial).  Not aggregated across epochs.
     p_near_KNe = float(np.mean(np.abs(y_dist - M_obs) <= k * sigma_obs))
 
     # 4. P_tail_KNe uncertainty — sample N_obs realisations of M_obs (paper Section 2)
@@ -355,7 +355,7 @@ def compute_consistent_ids_anyhit(
     bin_idx: int,
     M_obs: float,
     sigma_obs: float,
-    overlap_k: float = 2.0,
+    overlap_k: float = 1.5,
 ) -> List:
     """
     Return simulation IDs whose predicted magnitude falls within the ROPE at
@@ -474,7 +474,31 @@ def overlap_chain(ids_lists: List[List], times: List[float]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Logit-space cumulative P_tail_KNe scoring
 # ---------------------------------------------------------------------------
+def abc_collapse_time(metric_df: pd.DataFrame) -> float:
+    """
+    Time (days) of the first observation at which no simulation is consistent
+    with all observations so far, in any band (paper Sec. 3.5, ``|S_t| = 0``).
 
+    Observations of all bands are intersected in time order (ties broken by
+    band name), the same rule used by ``plot_final_all_metrics``.
+
+    Returns
+    -------
+    float
+        ``obs_time`` of the collapse, or ``nan`` if the survivors never reach
+        zero (or ``consistent_ids`` is missing).
+    """
+    if "consistent_ids" not in metric_df.columns or metric_df.empty:
+        return float("nan")
+    m = metric_df.sort_values(["obs_time", "band"])
+    running = None
+    for t, ids in zip(m["obs_time"], m["consistent_ids"]):
+        ids = set(ids) if isinstance(ids, (list, tuple, set, np.ndarray)) else set()
+        running = ids if running is None else running & ids
+        if not running:
+            return float(t)
+    return float("nan")
+  
 def binned_stats_cumulative_ptail(
     metric_df: pd.DataFrame,
     bin_size: float = 0.2,
@@ -504,8 +528,10 @@ def binned_stats_cumulative_ptail(
     -------
     pd.DataFrame
         One row per time bin with columns:
-        ``time_bin``, ``time_mid``, ``mean``, ``std``,
-        ``running_mean``, ``running_std``.
+        ``running_mean``, ``running_std`` (cumulative score, no ABC penalty),
+        ``t_collapse`` (ABC collapse time, NaN if none) and
+        ``running_mean_penalized``, ``running_std_penalized`` (cumulative
+        score set to 0 from the bin containing ``t_collapse`` onward).
     """
   #modify to match the bin edges of kilonovaScorer_V3 + bin_size / 2,
   #modidy back to +  bin_size
@@ -531,6 +557,20 @@ def binned_stats_cumulative_ptail(
     )
     binned_stats["running_mean"] = running_mean
     binned_stats["running_std"] = running_err
+    # ABC hard penalty (paper Sec. 3.5): once no simulation survives all
+    # epochs, the cumulative score is set to zero.  The un-penalised
+    # running_mean / running_std are kept as they are (the plots use them).
+    t_collapse = abc_collapse_time(metric_df)
+    binned_stats["t_collapse"] = t_collapse
+    pen_mean = binned_stats["running_mean"].to_numpy(dtype=float).copy()
+    pen_std = binned_stats["running_std"].to_numpy(dtype=float).copy()
+    if np.isfinite(t_collapse):
+        right_edge = np.array([b.right for b in binned_stats["time_bin"]], dtype=float)
+        after = right_edge >= t_collapse
+        pen_mean[after] = 0.0
+        pen_std[after] = 0.0
+    binned_stats["running_mean_penalized"] = pen_mean
+    binned_stats["running_std_penalized"] = pen_std
 
     return binned_stats
 
@@ -545,7 +585,7 @@ def kilonovascorer_v3(
     candidate_name: str,
     time_bin_width: float = 0.2,
     band_list: Tuple[str, ...] = ("g-band", "r-band", "i-band", "z-band"),
-    k_near: float = 1.5,
+    k_near: float = 3.0,
     n_kde_sim: int = 50000,
     min_sim_points: int = 20,
     overlap_k: float = 2.0,
@@ -703,6 +743,7 @@ def kilonovascorer_v3(
                 "p_tail_mean": metric["p_tail_mean"],
                 "p_tail_std": metric["p_tail_std"],
                 "p_near_KNe": metric["p_near_KNe"],
+                "prob_near": metric["p_near_KNe"],
                 "n_sim_bin": len(sim_bin),
                 "n_consistent_lcs": len(consistent_ids),
                 "consistent_ids": consistent_ids,
