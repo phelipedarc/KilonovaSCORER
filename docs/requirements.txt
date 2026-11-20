@@ -1,0 +1,6 @@
+sphinx>=7
+furo
+nbsphinx
+myst-parser
+sphinx-copybutton
+ipython
