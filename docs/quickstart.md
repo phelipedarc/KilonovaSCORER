@@ -72,7 +72,7 @@ Very dense light curves (like AT 2017gfo) are unrealistic for a real search. To 
 ```python
 np.random.seed(0)     # optional: makes the run repeatable
 
-metrics, overlap = ks.kilonovascorer_v1(
+metrics, overlap = ks.kilonovascorer_v3(
     obs, sims, "my_candidate",
     time_bin_width=0.2,                                  # days
     band_list=("g-band", "r-band", "i-band", "z-band"),
