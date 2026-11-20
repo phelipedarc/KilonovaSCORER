@@ -23,9 +23,6 @@ import KilonovaScorer as ks
 print(ks.__version__)
 ```
 
-```{important}
-The install name and the import name differ. Install `kilonova_scorer`, but import `KilonovaScorer` (capital K and S).
-```
 
 ## Optional: tools to make your own simulations
 
