@@ -32,7 +32,7 @@ The simulations are on Zenodo: <https://zenodo.org/records/19824266> (CC BY 4.0)
 | `simulations_IR_two_component_kilonova_model.csv` | 21.8 GB | Full grid. Does not fit in memory on most laptops. |
 
 ```{tip}
-Start with the 96 MB file. The paper tested grids from $10^2$ to $10^5$ light curves and found that $10^3$ gives scores within the typical score uncertainty ($|\Delta| \lesssim 0.1$), about 100× faster than $10^5$.
+Start with the 96 MB file. We tested grids from $10^2$ to $10^5$ light curves and found that $10^3$ gives scores within the typical score uncertainty ($|\Delta| \lesssim 0.1$), about 100× faster than $10^5$.
 ```
 
 Load it like this:
@@ -91,4 +91,3 @@ Things to know:
 
 - Size grows fast. $N$ light curves × 4 bands × 1000 times gives $4000\,N$ rows (4×10⁸ rows for $N=10^5$).
 - Distances are fixed in the code: absolute magnitudes assume $D_L = 259$ Mpc (the distance of S250818k).
-- Simulations use up to 6 CPU cores.
