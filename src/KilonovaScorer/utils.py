@@ -230,21 +230,33 @@ def calculate_sequential_score_logit(
     running_score = np.zeros(n)
     running_error = np.zeros(n)
 
+    means = np.asarray(means, dtype=float)
+    stds = np.asarray(stds, dtype=float)
     means_clipped = np.clip(means, eps, 1.0 - eps)
-    z     = logit(means_clipped)
-    z_std = stds / (means_clipped * (1.0 - means_clipped))  # delta method
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z     = logit(means_clipped)
+        z_std = stds / (means_clipped * (1.0 - means_clipped))  # delta method
 
-    # Initialise from first bin
-    current_z    = z[0]
-    current_prec = 1.0 / z_std[0] ** 2
-    running_score[0] = float(means_clipped[0])
-    running_error[0] = float(stds[0])
+    # A bin is usable only if its logit and uncertainty are finite and the
+    # uncertainty is > 0.  Bins whose scores are all exactly 0 (mean = 0,
+    # std = 0, see ivw_stats_logit) are NOT usable: they carry no weight and
+    # are skipped, exactly like NaN bins.  The ABC penalty, not this update,
+    # is what rejects such candidates.
+    usable = np.isfinite(z) & np.isfinite(z_std) & (z_std > 0)
 
-    for i in range(1, n):
-        if not np.isfinite(z[i]) or not np.isfinite(z_std[i]):
-            # Carry forward without update
-            running_score[i] = running_score[i - 1]
-            running_error[i] = running_error[i - 1]
+    current_z = current_prec = None
+    for i in range(n):
+        if not usable[i]:
+            if current_z is not None:        # carry forward
+                running_score[i] = running_score[i - 1]
+                running_error[i] = running_error[i - 1]
+            continue                          # leading unusable bins stay 0
+
+        if current_z is None:                 # first usable bin
+            current_z    = z[i]
+            current_prec = 1.0 / z_std[i] ** 2
+            running_score[i] = float(means_clipped[i])
+            running_error[i] = float(stds[i])
             continue
 
         new_prec     = 1.0 / z_std[i] ** 2
@@ -257,7 +269,6 @@ def calculate_sequential_score_logit(
         score_i = float(expit(updated_z))
         running_score[i] = score_i
         running_error[i] = score_i * (1.0 - score_i) * np.sqrt(1.0 / updated_prec)
-
     return running_score, running_error
 
 
